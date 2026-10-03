@@ -1,0 +1,3306 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local Camera = Workspace.CurrentCamera or Workspace:WaitForChild("Camera")
+local TeleportService = game:GetService("TeleportService")
+
+-- UI helpers (avoids burning local registers on one-off corners/strokes)
+local function addCorner(parent, radius)
+    do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, radius or 8); c.Parent = parent end
+    return c
+end
+local function addStroke(parent, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color or Color3.fromRGB(160, 80, 220)
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0.8
+    s.Parent = parent
+    return s
+end
+
+local Player = Players.LocalPlayer
+local Mouse = Player:GetMouse()
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+local RootPart = Character:WaitForChild("HumanoidRootPart")
+
+-- State
+local Flying = false
+local SpeedBoost = false
+local AirWalk = false
+local Noclip = false
+local TPToolActive = false
+local TPToolInstance
+local ScriptActive = true
+local SelectedPlayer = nil
+local AttachmentMode = nil -- headsit, backpack, stand, doggy, drag, or nil
+local FlingActive = false
+
+-- =========================
+-- SHADER CONFIG (edit these)
+-- =========================
+local SHADER_CONFIG = {
+    -- Default tint when shaders turn on
+    Tint = Color3.fromRGB(165, 85, 255),
+
+    -- Lighting
+    Brightness = 2.25,
+    Exposure = 0.12,
+    ClockTime = 17.4, -- 0-24 (17.4 = evening)
+
+    -- Sky / sun
+    StarCount = 2800,
+    SunAngularSize = 22,
+    HeartSun = true, -- heart sun texture
+    SunTextureId = "rbxassetid://102002410058409",
+
+    -- Skybox asset ids
+    SkyboxBk = "rbxassetid://144933338",
+    SkyboxDn = "rbxassetid://144931530",
+    SkyboxFt = "rbxassetid://144933262",
+    SkyboxLf = "rbxassetid://144933244",
+    SkyboxRt = "rbxassetid://144933299",
+    SkyboxUp = "rbxassetid://144931564",
+
+    -- Effects
+    BloomIntensity = 0.4,
+    BloomSize = 18,
+    BloomThreshold = 0.68,
+    BlurSize = 1.5,
+    CCBrightness = 0.03,
+    CCContrast = 0.14,
+    CCSaturation = 0.32,
+    SunRaysIntensity = 0.12,
+    SunRaysSpread = 0.72,
+
+    -- Auto-enable shaders when picking a color on the wheel
+    AutoEnableOnTint = true,
+}
+
+-- Shader state
+local ShaderEnabled = false
+local ShaderTint = SHADER_CONFIG.Tint
+local ShaderSnap = nil
+local ColorWheelActive = false
+
+-- =========================
+-- FULL SCRIPT CONFIG
+-- =========================
+local CONFIG_FILE = "aether_config.json"
+local CurrentConfigName = "default"
+
+-- Auto-load this config when the script starts (set to nil or "" to disable)
+-- Must match a name you saved with SAVE CONFIG (file: aether_<name>.json)
+local AUTO_LOAD_CONFIG = "default"
+local AUTO_LOAD_DELAY = 0.5 -- seconds to wait before loading (lets character/UI settle)
+
+local function colorToTable(c)
+    return { r = math.floor(c.R * 255 + 0.5), g = math.floor(c.G * 255 + 0.5), b = math.floor(c.B * 255 + 0.5) }
+end
+local function tableToColor(t)
+    if type(t) ~= "table" then return Color3.fromRGB(165, 85, 255) end
+    return Color3.fromRGB(tonumber(t.r) or 165, tonumber(t.g) or 85, tonumber(t.b) or 255)
+end
+
+-- Config functions assigned later (after all state exists)
+local buildConfig, applyConfig, encodeConfig, decodeConfig
+local saveConfigToFile, loadConfigFromFile, refreshConfigUI
+
+-- Fly variables
+local FlySpeed = 50
+local NormalSpeed = Humanoid.WalkSpeed
+local BoostSpeed = 100
+local CurrentVelocity = Vector3.new()
+local FlyAcceleration = 150
+local FlySprintMultiplier = 2
+local MinSpeed = 10
+local MaxSpeed = 200
+
+-- Speed Boost variables
+local MinBoostSpeed = 50
+local MaxBoostSpeed = 200
+
+local AirWalkButton, AntiAFKToggle, AntiAllButton, AntiAllPopup, AntiGameplayToggle, AntiSitToggle, AntiVoidToggle, BackpackButton
+local BoostLabel, BoostSliderFill, BoostSliderHandle, BoostSliderTrack, ClosePopupButton, DestroyButton, DoggyButton, DragButton
+local FlingButton, FlyButton, HeadsitButton, MainFrame, MainGradient, MovementContent, NoclipButton, PlayerCountLabel
+local PlayerListFrame, PlayerListLayout, PlayerNameInput, RejoinButton, RespawnTPButton, ScreenGui, SelectedAvatar, SelectedLabel
+local SettingsContent, ShaderButton, ShaderPresetButtons, Shadow, SliderFill, SliderHandle, SliderTrack, SpeedButton
+local ConfigNameBox, SaveConfigButton, LoadConfigButton, ConfigStatusLabel
+local SpeedLabel, StandButton, TPMapButton, TPToolButton, Tab1, Tab2, Tab3, Tab4, TabContainer
+local SettingsTabContent, MenuKeyButton
+local MenuToggleKey = Enum.KeyCode.B
+local MenuKeyCapturing = false
+local TargetContent, TeleportButton, Title, VCButton, ViewButton, ShaderPresets
+
+do
+-- UI Setup
+ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "AetherUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = Player:WaitForChild("PlayerGui")
+
+-- Main Frame (cool dark glass + neon)
+MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 520, 0, 520)
+MainFrame.Position = UDim2.new(0.5, -260, 0.5, -260)
+MainFrame.BackgroundColor3 = Color3.fromRGB(12, 12, 20)
+MainFrame.BackgroundTransparency = 0.05
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Parent = ScreenGui
+
+MainGradient = Instance.new("UIGradient")
+MainGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(18, 18, 32)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(10, 10, 18))
+})
+MainGradient.Rotation = 90
+MainGradient.Parent = MainFrame
+
+-- Outer neon stroke
+addStroke(MainFrame, Color3.fromRGB(180, 80, 255), 1.5, 0.35)
+
+addCorner(MainFrame, 16)
+
+-- Title bar
+Title = Instance.new("TextButton")
+Title.Name = "Title"
+Title.Size = UDim2.new(1, 0, 0, 48)
+Title.Position = UDim2.new(0, 0, 0, 0)
+Title.BackgroundColor3 = Color3.fromRGB(22, 24, 40)
+Title.BorderSizePixel = 0
+Title.Text = "AETHER"
+Title.TextColor3 = Color3.fromRGB(190, 90, 255)
+Title.TextSize = 20
+Title.Font = Enum.Font.GothamBold
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.AutoButtonColor = false
+Title.Parent = MainFrame
+
+addCorner(Title, 16)
+
+local TitlePadding = Instance.new("UIPadding")
+TitlePadding.PaddingTop = UDim.new(0, 8)
+TitlePadding.PaddingLeft = UDim.new(0, 16)
+TitlePadding.PaddingRight = UDim.new(0, 130)
+TitlePadding.Parent = Title
+
+
+-- Accent line under title
+local TitleAccent = Instance.new("Frame")
+TitleAccent.Name = "TitleAccent"
+TitleAccent.Size = UDim2.new(0.7, 0, 0, 2)
+TitleAccent.Position = UDim2.new(0.15, 0, 1, -2)
+TitleAccent.BackgroundColor3 = Color3.fromRGB(190, 90, 255)
+TitleAccent.BorderSizePixel = 0
+TitleAccent.Parent = Title
+
+local TitleAccentGrad = Instance.new("UIGradient")
+TitleAccentGrad.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 1),
+    NumberSequenceKeypoint.new(0.3, 0.2),
+    NumberSequenceKeypoint.new(0.7, 0.2),
+    NumberSequenceKeypoint.new(1, 1)
+})
+TitleAccentGrad.Parent = TitleAccent
+
+-- Player count (visible on all tabs)
+PlayerCountLabel = Instance.new("TextLabel")
+PlayerCountLabel.Name = "PlayerCountLabel"
+PlayerCountLabel.Size = UDim2.new(0, 120, 0, 20)
+PlayerCountLabel.Position = UDim2.new(1, -130, 0.5, -10)
+PlayerCountLabel.BackgroundTransparency = 1
+PlayerCountLabel.Text = #Players:GetPlayers() .. " / " .. Players.MaxPlayers
+PlayerCountLabel.TextColor3 = Color3.fromRGB(230, 180, 255)
+PlayerCountLabel.TextSize = 13
+PlayerCountLabel.Font = Enum.Font.GothamSemibold
+PlayerCountLabel.TextXAlignment = Enum.TextXAlignment.Right
+PlayerCountLabel.Parent = Title
+
+local function UpdatePlayerCount()
+    local current = #Players:GetPlayers()
+    local maxPlayers = Players.MaxPlayers
+    PlayerCountLabel.Text = current .. " / " .. maxPlayers
+end
+Players.PlayerAdded:Connect(UpdatePlayerCount)
+Players.PlayerRemoving:Connect(function()
+    task.defer(UpdatePlayerCount)
+end)
+
+-- Tab Buttons Container
+TabContainer = Instance.new("Frame")
+TabContainer.Name = "TabContainer"
+TabContainer.Size = UDim2.new(1, -20, 0, 34)
+TabContainer.Position = UDim2.new(0, 10, 0, 52)
+TabContainer.BackgroundTransparency = 1
+TabContainer.Parent = MainFrame
+
+-- Tab 1: Movement
+Tab1 = Instance.new("TextButton")
+Tab1.Name = "Tab1"
+Tab1.Size = UDim2.new(0.25, -4, 1, 0)
+Tab1.Position = UDim2.new(0, 0, 0, 0)
+Tab1.BackgroundColor3 = Color3.fromRGB(140, 60, 200)
+Tab1.BorderSizePixel = 0
+Tab1.Text = "MOVEMENT"
+Tab1.TextColor3 = Color3.fromRGB(255, 255, 255)
+Tab1.TextSize = 12
+Tab1.Font = Enum.Font.GothamBold
+Tab1.AutoButtonColor = false
+Tab1.Parent = TabContainer
+
+addCorner(Tab1, 8)
+
+addStroke(Tab1, Color3.fromRGB(190, 90, 255), 1, 0.4)
+
+-- Tab 2: Target
+Tab2 = Instance.new("TextButton")
+Tab2.Name = "Tab2"
+Tab2.Size = UDim2.new(0.25, -4, 1, 0)
+Tab2.Position = UDim2.new(0.25, 2, 0, 0)
+Tab2.BackgroundColor3 = Color3.fromRGB(28, 30, 48)
+Tab2.BorderSizePixel = 0
+Tab2.Text = "TARGET"
+Tab2.TextColor3 = Color3.fromRGB(160, 170, 200)
+Tab2.TextSize = 12
+Tab2.Font = Enum.Font.GothamSemibold
+Tab2.AutoButtonColor = false
+Tab2.Parent = TabContainer
+
+addCorner(Tab2, 8)
+
+addStroke(Tab2, Color3.fromRGB(60, 70, 100), 1, 0.5)
+
+-- Tab 3: Settings
+Tab3 = Instance.new("TextButton")
+Tab3.Name = "Tab3"
+Tab3.Size = UDim2.new(0.25, -4, 1, 0)
+Tab3.Position = UDim2.new(0.50, 2, 0, 0)
+Tab3.BackgroundColor3 = Color3.fromRGB(28, 30, 48)
+Tab3.BorderSizePixel = 0
+Tab3.Text = "MISC"
+Tab3.TextColor3 = Color3.fromRGB(160, 170, 200)
+Tab3.TextSize = 12
+Tab3.Font = Enum.Font.GothamSemibold
+Tab3.AutoButtonColor = false
+Tab3.Parent = TabContainer
+
+addCorner(Tab3, 8)
+addStroke(Tab3, Color3.fromRGB(60, 70, 100), 1, 0.5)
+
+Tab4 = Instance.new("TextButton")
+Tab4.Name = "Tab4"
+Tab4.Size = UDim2.new(0.25, -4, 1, 0)
+Tab4.Position = UDim2.new(0.75, 2, 0, 0)
+Tab4.BackgroundColor3 = Color3.fromRGB(28, 30, 48)
+Tab4.BorderSizePixel = 0
+Tab4.Text = "SETTINGS"
+Tab4.TextColor3 = Color3.fromRGB(160, 170, 200)
+Tab4.TextSize = 12
+Tab4.Font = Enum.Font.GothamSemibold
+Tab4.AutoButtonColor = false
+Tab4.Parent = TabContainer
+
+addCorner(Tab4, 8)
+addStroke(Tab4, Color3.fromRGB(60, 70, 100), 1, 0.5)
+
+-- Content Frames
+MovementContent = Instance.new("Frame")
+MovementContent.Name = "MovementContent"
+MovementContent.Size = UDim2.new(1, 0, 1, -95)
+MovementContent.Position = UDim2.new(0, 0, 0, 95)
+MovementContent.BackgroundTransparency = 1
+MovementContent.Parent = MainFrame
+
+TargetContent = Instance.new("Frame")
+TargetContent.Name = "TargetContent"
+TargetContent.Size = UDim2.new(1, 0, 1, -95)
+TargetContent.Position = UDim2.new(0, 0, 0, 95)
+TargetContent.BackgroundTransparency = 1
+TargetContent.Visible = false
+TargetContent.Parent = MainFrame
+
+-- Player List Scrolling Frame
+PlayerListFrame = Instance.new("ScrollingFrame")
+PlayerListFrame.Name = "PlayerListFrame"
+PlayerListFrame.Size = UDim2.new(0.9, 0, 0.28, 0)
+PlayerListFrame.Position = UDim2.new(0.05, 0, 0.22, 0)
+PlayerListFrame.BackgroundTransparency = 1
+PlayerListFrame.ScrollBarThickness = 4
+PlayerListFrame.ScrollBarImageColor3 = Color3.fromRGB(160, 80, 220)
+PlayerListFrame.Parent = TargetContent
+
+PlayerListLayout = Instance.new("UIListLayout")
+PlayerListLayout.Padding = UDim.new(0, 5)
+PlayerListLayout.Parent = PlayerListFrame
+
+-- Selected Player Label
+SelectedLabel = Instance.new("TextLabel")
+SelectedLabel.Name = "SelectedLabel"
+SelectedLabel.Size = UDim2.new(0.9, 0, 0, 20)
+SelectedLabel.Position = UDim2.new(0.05, 0, 0.17, 0)
+SelectedLabel.BackgroundTransparency = 1
+SelectedLabel.Text = "Selected: None"
+SelectedLabel.TextColor3 = Color3.fromRGB(150, 160, 190)
+SelectedLabel.TextSize = 13
+SelectedLabel.Font = Enum.Font.Gotham
+SelectedLabel.Parent = TargetContent
+
+-- Player Name Input
+SelectedAvatar = Instance.new("ImageLabel")
+SelectedAvatar.Name = "SelectedAvatar"
+SelectedAvatar.Size = UDim2.new(0, 35, 0, 35)
+SelectedAvatar.Position = UDim2.new(0.05, 0, 0.12, 0)
+SelectedAvatar.BackgroundColor3 = Color3.fromRGB(24, 26, 42)
+SelectedAvatar.BorderSizePixel = 0
+SelectedAvatar.Image = ""
+SelectedAvatar.Parent = TargetContent
+
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(1, 0); c.Parent = SelectedAvatar end
+
+addStroke(SelectedAvatar, Color3.fromRGB(160, 80, 220), 1, 0.4)
+
+PlayerNameInput = Instance.new("TextBox")
+PlayerNameInput.Name = "PlayerNameInput"
+PlayerNameInput.Size = UDim2.new(0.75, 0, 0, 35)
+PlayerNameInput.Position = UDim2.new(0.05, 42, 0.12, 0)
+PlayerNameInput.BackgroundColor3 = Color3.fromRGB(24, 26, 42)
+PlayerNameInput.BorderSizePixel = 0
+PlayerNameInput.PlaceholderText = "Type player name..."
+PlayerNameInput.PlaceholderColor3 = Color3.fromRGB(90, 100, 130)
+PlayerNameInput.Text = ""
+PlayerNameInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+PlayerNameInput.TextSize = 14
+PlayerNameInput.Font = Enum.Font.Gotham
+PlayerNameInput.Parent = TargetContent
+
+addCorner(PlayerNameInput, 8)
+
+addStroke(PlayerNameInput, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+-- Headsit Button
+-- Helper to style target action buttons
+local function MakeTargetBtn(name, text, xScale, yScale)
+    local btn = Instance.new("TextButton")
+    btn.Name = name
+    btn.Size = UDim2.new(0.28, 0, 0, 36)
+    btn.Position = UDim2.new(xScale, 0, yScale, 0)
+    btn.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    btn.BorderSizePixel = 0
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.TextSize = 12
+    btn.Font = Enum.Font.GothamSemibold
+    btn.Parent = TargetContent
+    addCorner(btn, 8)
+    addStroke(btn, Color3.fromRGB(160, 80, 220), 1, 0.8)
+    return btn
+end
+
+HeadsitButton = MakeTargetBtn("HeadsitButton", "HEADSIT", 0.05, 0.52)
+BackpackButton = MakeTargetBtn("BackpackButton", "BACKPACK", 0.36, 0.52)
+StandButton = MakeTargetBtn("StandButton", "STAND", 0.67, 0.52)
+DoggyButton = MakeTargetBtn("DoggyButton", "DOGGY", 0.05, 0.63)
+DragButton = MakeTargetBtn("DragButton", "DRAG", 0.36, 0.63)
+TeleportButton = MakeTargetBtn("TeleportButton", "TELEPORT", 0.05, 0.74)
+ViewButton = MakeTargetBtn("ViewButton", "VIEW", 0.36, 0.74)
+FlingButton = MakeTargetBtn("FlingButton", "FLING", 0.67, 0.74)
+
+SettingsContent = Instance.new("ScrollingFrame")
+SettingsContent.Name = "SettingsContent"
+SettingsContent.Size = UDim2.new(1, 0, 1, -95)
+SettingsContent.Position = UDim2.new(0, 0, 0, 95)
+SettingsContent.BackgroundTransparency = 1
+SettingsContent.Visible = false
+SettingsContent.ScrollBarThickness = 4
+SettingsContent.ScrollBarImageColor3 = Color3.fromRGB(160, 80, 220)
+SettingsContent.CanvasSize = UDim2.new(0, 0, 0, 640)
+SettingsContent.Parent = MainFrame
+
+-- Settings tab content (destroy, config, keybinds)
+SettingsTabContent = Instance.new("ScrollingFrame")
+SettingsTabContent.Name = "SettingsTabContent"
+SettingsTabContent.Size = UDim2.new(1, 0, 1, -95)
+SettingsTabContent.Position = UDim2.new(0, 0, 0, 95)
+SettingsTabContent.BackgroundTransparency = 1
+SettingsTabContent.Visible = false
+SettingsTabContent.ScrollBarThickness = 4
+SettingsTabContent.ScrollBarImageColor3 = Color3.fromRGB(160, 80, 220)
+SettingsTabContent.CanvasSize = UDim2.new(0, 0, 0, 420)
+SettingsTabContent.Parent = MainFrame
+
+-- Fly Button
+FlyButton = Instance.new("TextButton")
+FlyButton.Name = "FlyButton"
+FlyButton.Size = UDim2.new(0.85, 0, 0, 50)
+FlyButton.Position = UDim2.new(0.075, 0, 0, 10)
+FlyButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+FlyButton.BorderSizePixel = 0
+FlyButton.Text = "FLY: OFF"
+FlyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+FlyButton.TextSize = 14
+FlyButton.Font = Enum.Font.GothamSemibold
+FlyButton.Parent = MovementContent
+
+addCorner(FlyButton, 10)
+
+addStroke(FlyButton, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+-- Speed Button
+SpeedButton = Instance.new("TextButton")
+SpeedButton.Name = "SpeedButton"
+SpeedButton.Size = UDim2.new(0.85, 0, 0, 50)
+SpeedButton.Position = UDim2.new(0.075, 0, 0, 70)
+SpeedButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+SpeedButton.BorderSizePixel = 0
+SpeedButton.Text = "SPEED: OFF"
+SpeedButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+SpeedButton.TextSize = 14
+SpeedButton.Font = Enum.Font.GothamSemibold
+SpeedButton.Parent = MovementContent
+
+addCorner(SpeedButton, 10)
+
+addStroke(SpeedButton, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+-- Air Walk Button
+AirWalkButton = Instance.new("TextButton")
+AirWalkButton.Name = "AirWalkButton"
+AirWalkButton.Size = UDim2.new(0.85, 0, 0, 50)
+AirWalkButton.Position = UDim2.new(0.075, 0, 0, 130)
+AirWalkButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+AirWalkButton.BorderSizePixel = 0
+AirWalkButton.Text = "AIR WALK: OFF"
+AirWalkButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+AirWalkButton.TextSize = 14
+AirWalkButton.Font = Enum.Font.GothamSemibold
+AirWalkButton.Parent = MovementContent
+
+addCorner(AirWalkButton, 10)
+
+addStroke(AirWalkButton, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+-- TP Tool Button
+TPToolButton = Instance.new("TextButton")
+TPToolButton.Name = "TPToolButton"
+TPToolButton.Size = UDim2.new(0.85, 0, 0, 50)
+TPToolButton.Position = UDim2.new(0.075, 0, 0, 190)
+TPToolButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+TPToolButton.BorderSizePixel = 0
+TPToolButton.Text = "TP TOOL: OFF"
+TPToolButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+TPToolButton.TextSize = 14
+TPToolButton.Font = Enum.Font.GothamSemibold
+TPToolButton.Parent = MovementContent
+
+addCorner(TPToolButton, 10)
+
+addStroke(TPToolButton, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+-- Noclip Button
+NoclipButton = Instance.new("TextButton")
+NoclipButton.Name = "NoclipButton"
+NoclipButton.Size = UDim2.new(0.85, 0, 0, 50)
+NoclipButton.Position = UDim2.new(0.075, 0, 0, 250)
+NoclipButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+NoclipButton.BorderSizePixel = 0
+NoclipButton.Text = "NOCLIP: OFF"
+NoclipButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+NoclipButton.TextSize = 14
+NoclipButton.Font = Enum.Font.GothamSemibold
+NoclipButton.Parent = MovementContent
+
+addCorner(NoclipButton, 10)
+
+addStroke(NoclipButton, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+-- Speed Slider Label
+SpeedLabel = Instance.new("TextLabel")
+SpeedLabel.Name = "SpeedLabel"
+SpeedLabel.Size = UDim2.new(0.85, 0, 0, 18)
+SpeedLabel.Position = UDim2.new(0.075, 0, 0, 330)
+SpeedLabel.BackgroundTransparency = 1
+SpeedLabel.Text = "Fly Speed: 50"
+SpeedLabel.TextColor3 = Color3.fromRGB(150, 160, 190)
+SpeedLabel.TextSize = 13
+SpeedLabel.Font = Enum.Font.Gotham
+SpeedLabel.Parent = MovementContent
+
+-- Speed Slider Track
+SliderTrack = Instance.new("TextButton")
+SliderTrack.Name = "SliderTrack"
+SliderTrack.Size = UDim2.new(0.85, 0, 0, 10)
+SliderTrack.Position = UDim2.new(0.075, 0, 0, 310)
+SliderTrack.BackgroundColor3 = Color3.fromRGB(24, 26, 42)
+SliderTrack.BorderSizePixel = 0
+SliderTrack.Text = ""
+SliderTrack.AutoButtonColor = false
+SliderTrack.Parent = MovementContent
+
+addCorner(SliderTrack, 5)
+
+-- Speed Slider Fill
+SliderFill = Instance.new("Frame")
+SliderFill.Name = "SliderFill"
+SliderFill.Size = UDim2.new(0.5, 0, 1, 0)
+SliderFill.BackgroundColor3 = Color3.fromRGB(180, 80, 255)
+SliderFill.BorderSizePixel = 0
+SliderFill.Parent = SliderTrack
+
+local FillGradient = Instance.new("UIGradient")
+FillGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(180, 80, 255)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(160, 100, 255))
+})
+FillGradient.Parent = SliderFill
+
+addCorner(SliderFill, 5)
+
+-- Speed Slider Handle
+SliderHandle = Instance.new("TextButton")
+SliderHandle.Name = "SliderHandle"
+SliderHandle.Size = UDim2.new(0, 18, 0, 18)
+SliderHandle.Position = UDim2.new(0.5, -9, 0, -4)
+SliderHandle.BackgroundColor3 = Color3.fromRGB(200, 100, 255)
+SliderHandle.BorderSizePixel = 0
+SliderHandle.Text = ""
+SliderHandle.AutoButtonColor = false
+SliderHandle.ZIndex = 2
+SliderHandle.Parent = SliderTrack
+
+local HandleShadow = Instance.new("Frame")
+HandleShadow.Name = "HandleShadow"
+HandleShadow.Size = UDim2.new(1, 4, 1, 4)
+HandleShadow.Position = UDim2.new(0, -2, 0, 2)
+HandleShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+HandleShadow.BackgroundTransparency = 0.6
+HandleShadow.BorderSizePixel = 0
+HandleShadow.ZIndex = 1
+HandleShadow.Parent = SliderHandle
+
+addCorner(HandleShadow, 9)
+
+addCorner(SliderHandle, 9)
+
+-- Boost Speed Label
+BoostLabel = Instance.new("TextLabel")
+BoostLabel.Name = "BoostLabel"
+BoostLabel.Size = UDim2.new(0.85, 0, 0, 18)
+BoostLabel.Position = UDim2.new(0.075, 0, 0, 390)
+BoostLabel.BackgroundTransparency = 1
+BoostLabel.Text = "Boost Speed: 100"
+BoostLabel.TextColor3 = Color3.fromRGB(150, 160, 190)
+BoostLabel.TextSize = 13
+BoostLabel.Font = Enum.Font.Gotham
+BoostLabel.Parent = MovementContent
+
+-- Boost Slider Track
+BoostSliderTrack = Instance.new("TextButton")
+BoostSliderTrack.Name = "BoostSliderTrack"
+BoostSliderTrack.Size = UDim2.new(0.85, 0, 0, 10)
+BoostSliderTrack.Position = UDim2.new(0.075, 0, 0, 370)
+BoostSliderTrack.BackgroundColor3 = Color3.fromRGB(24, 26, 42)
+BoostSliderTrack.BorderSizePixel = 0
+BoostSliderTrack.Text = ""
+BoostSliderTrack.AutoButtonColor = false
+BoostSliderTrack.Parent = MovementContent
+
+addCorner(BoostSliderTrack, 5)
+
+-- Boost Slider Fill
+BoostSliderFill = Instance.new("Frame")
+BoostSliderFill.Name = "BoostSliderFill"
+BoostSliderFill.Size = UDim2.new(0.25, 0, 1, 0)
+BoostSliderFill.BackgroundColor3 = Color3.fromRGB(180, 80, 255)
+BoostSliderFill.BorderSizePixel = 0
+BoostSliderFill.Parent = BoostSliderTrack
+
+local BoostFillGradient = Instance.new("UIGradient")
+BoostFillGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(180, 80, 255)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(160, 100, 255))
+})
+BoostFillGradient.Parent = BoostSliderFill
+
+addCorner(BoostSliderFill, 5)
+
+-- Boost Slider Handle
+BoostSliderHandle = Instance.new("TextButton")
+BoostSliderHandle.Name = "BoostSliderHandle"
+BoostSliderHandle.Size = UDim2.new(0, 18, 0, 18)
+BoostSliderHandle.Position = UDim2.new(0.25, -9, 0, -4)
+BoostSliderHandle.BackgroundColor3 = Color3.fromRGB(200, 100, 255)
+BoostSliderHandle.BorderSizePixel = 0
+BoostSliderHandle.Text = ""
+BoostSliderHandle.AutoButtonColor = false
+BoostSliderHandle.ZIndex = 2
+BoostSliderHandle.Parent = BoostSliderTrack
+
+local BoostHandleShadow = Instance.new("Frame")
+BoostHandleShadow.Name = "BoostHandleShadow"
+BoostHandleShadow.Size = UDim2.new(1, 4, 1, 4)
+BoostHandleShadow.Position = UDim2.new(0, -2, 0, 2)
+BoostHandleShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+BoostHandleShadow.BackgroundTransparency = 0.6
+BoostHandleShadow.BorderSizePixel = 0
+BoostHandleShadow.ZIndex = 1
+BoostHandleShadow.Parent = BoostSliderHandle
+
+addCorner(BoostHandleShadow, 9)
+
+addCorner(BoostSliderHandle, 9)
+
+-- Destroy Button
+DestroyButton = Instance.new("TextButton")
+DestroyButton.Name = "DestroyButton"
+DestroyButton.Size = UDim2.new(0.85, 0, 0, 50)
+DestroyButton.Position = UDim2.new(0.075, 0, 0, 10)
+DestroyButton.BackgroundColor3 = Color3.fromRGB(220, 55, 70)
+DestroyButton.BorderSizePixel = 0
+DestroyButton.Text = "DESTROY SCRIPT"
+DestroyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+DestroyButton.TextSize = 14
+DestroyButton.Font = Enum.Font.GothamSemibold
+DestroyButton.Parent = SettingsTabContent
+
+addCorner(DestroyButton, 10)
+
+addStroke(DestroyButton, Color3.fromRGB(150, 80, 80), 1, 0.5)
+
+-- Menu keybind (Settings tab)
+local keyLabel = Instance.new("TextLabel")
+keyLabel.Size = UDim2.new(0.9, 0, 0, 18)
+keyLabel.Position = UDim2.new(0.05, 0, 0, 70)
+keyLabel.BackgroundTransparency = 1
+keyLabel.Text = "MENU KEYBIND"
+keyLabel.TextColor3 = Color3.fromRGB(200, 100, 255)
+keyLabel.TextSize = 12
+keyLabel.Font = Enum.Font.GothamBold
+keyLabel.TextXAlignment = Enum.TextXAlignment.Left
+keyLabel.Parent = SettingsTabContent
+
+MenuKeyButton = Instance.new("TextButton")
+MenuKeyButton.Name = "MenuKeyButton"
+MenuKeyButton.Size = UDim2.new(0.9, 0, 0, 40)
+MenuKeyButton.Position = UDim2.new(0.05, 0, 0, 92)
+MenuKeyButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+MenuKeyButton.BorderSizePixel = 0
+MenuKeyButton.Text = "TOGGLE MENU: B"
+MenuKeyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+MenuKeyButton.TextSize = 13
+MenuKeyButton.Font = Enum.Font.GothamSemibold
+MenuKeyButton.Parent = SettingsTabContent
+addCorner(MenuKeyButton, 10)
+addStroke(MenuKeyButton, Color3.fromRGB(160, 80, 220), 1, 0.7)
+
+MenuKeyButton.MouseButton1Click:Connect(function()
+    MenuKeyCapturing = true
+    MenuKeyButton.Text = "PRESS A KEY..."
+    MenuKeyButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+end)
+
+-- Rejoin Button
+RejoinButton = Instance.new("TextButton")
+RejoinButton.Name = "RejoinButton"
+RejoinButton.Size = UDim2.new(0.85, 0, 0, 50)
+RejoinButton.Position = UDim2.new(0.075, 0, 0, 70)
+RejoinButton.BackgroundColor3 = Color3.fromRGB(120, 60, 200)
+RejoinButton.BorderSizePixel = 0
+RejoinButton.Text = "REJOIN GAME"
+RejoinButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+RejoinButton.TextSize = 14
+RejoinButton.Font = Enum.Font.GothamSemibold
+RejoinButton.Parent = SettingsContent
+
+addCorner(RejoinButton, 10)
+
+-- Respawn TP Toggle
+RespawnTPButton = Instance.new("TextButton")
+RespawnTPButton.Name = "RespawnTPButton"
+RespawnTPButton.Size = UDim2.new(0.85, 0, 0, 50)
+RespawnTPButton.Position = UDim2.new(0.075, 0, 0, 130)
+RespawnTPButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+RespawnTPButton.BorderSizePixel = 0
+RespawnTPButton.Text = "RESPAWN TP: OFF"
+RespawnTPButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+RespawnTPButton.TextSize = 14
+RespawnTPButton.Font = Enum.Font.GothamSemibold
+RespawnTPButton.Parent = SettingsContent
+
+addCorner(RespawnTPButton, 10)
+
+addStroke(RespawnTPButton, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+-- VC Bypass Button
+VCButton = Instance.new("TextButton")
+VCButton.Name = "VCButton"
+VCButton.Size = UDim2.new(0.85, 0, 0, 50)
+VCButton.Position = UDim2.new(0.075, 0, 0, 190)
+VCButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+VCButton.BorderSizePixel = 0
+VCButton.Text = "VC BYPASS"
+VCButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+VCButton.TextSize = 14
+VCButton.Font = Enum.Font.GothamSemibold
+VCButton.Parent = SettingsContent
+
+addCorner(VCButton, 10)
+
+addStroke(VCButton, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+-- Anti All Button
+AntiAllButton = Instance.new("TextButton")
+AntiAllButton.Name = "AntiAllButton"
+AntiAllButton.Size = UDim2.new(0.85, 0, 0, 50)
+AntiAllButton.Position = UDim2.new(0.075, 0, 0, 250)
+AntiAllButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+AntiAllButton.BorderSizePixel = 0
+AntiAllButton.Text = "ANTI ALL"
+AntiAllButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+AntiAllButton.TextSize = 14
+AntiAllButton.Font = Enum.Font.GothamSemibold
+AntiAllButton.Parent = SettingsContent
+
+addCorner(AntiAllButton, 10)
+
+addStroke(AntiAllButton, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+-- Anti All Popup (standalone movable window)
+AntiAllPopup = Instance.new("Frame")
+AntiAllPopup.Name = "AntiAllPopup"
+AntiAllPopup.Size = UDim2.new(0, 280, 0, 310)
+AntiAllPopup.Position = UDim2.new(0.5, -140, 0.5, -155)
+AntiAllPopup.BackgroundColor3 = Color3.fromRGB(12, 12, 20)
+AntiAllPopup.BackgroundTransparency = 0.05
+AntiAllPopup.BorderSizePixel = 0
+AntiAllPopup.Visible = false
+AntiAllPopup.ZIndex = 10
+AntiAllPopup.Parent = ScreenGui
+
+addCorner(AntiAllPopup, 14)
+addStroke(AntiAllPopup, Color3.fromRGB(180, 80, 255), 1.5, 0.35)
+
+local AntiAllGrad = Instance.new("UIGradient")
+AntiAllGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(28, 18, 45)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(14, 12, 24)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(28, 18, 45)),
+})
+AntiAllGrad.Rotation = 90
+AntiAllGrad.Parent = AntiAllPopup
+
+-- Title bar (drag handle)
+local AntiAllTitle = Instance.new("TextButton")
+AntiAllTitle.Name = "AntiAllTitle"
+AntiAllTitle.Size = UDim2.new(1, 0, 0, 40)
+AntiAllTitle.Position = UDim2.new(0, 0, 0, 0)
+AntiAllTitle.BackgroundColor3 = Color3.fromRGB(22, 24, 40)
+AntiAllTitle.BorderSizePixel = 0
+AntiAllTitle.Text = "  ANTI ALL"
+AntiAllTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+AntiAllTitle.TextSize = 14
+AntiAllTitle.Font = Enum.Font.GothamBold
+AntiAllTitle.TextXAlignment = Enum.TextXAlignment.Left
+AntiAllTitle.AutoButtonColor = false
+AntiAllTitle.ZIndex = 11
+AntiAllTitle.Parent = AntiAllPopup
+
+addCorner(AntiAllTitle, 14)
+
+local AntiAllTitleAccent = Instance.new("Frame")
+AntiAllTitleAccent.Size = UDim2.new(1, -24, 0, 2)
+AntiAllTitleAccent.Position = UDim2.new(0, 12, 1, -2)
+AntiAllTitleAccent.BackgroundColor3 = Color3.fromRGB(180, 80, 255)
+AntiAllTitleAccent.BackgroundTransparency = 0.3
+AntiAllTitleAccent.BorderSizePixel = 0
+AntiAllTitleAccent.ZIndex = 12
+AntiAllTitleAccent.Parent = AntiAllTitle
+
+-- Close X on title
+ClosePopupButton = Instance.new("TextButton")
+ClosePopupButton.Name = "ClosePopupButton"
+ClosePopupButton.Size = UDim2.new(0, 32, 0, 28)
+ClosePopupButton.Position = UDim2.new(1, -40, 0, 6)
+ClosePopupButton.BackgroundColor3 = Color3.fromRGB(160, 50, 60)
+ClosePopupButton.BorderSizePixel = 0
+ClosePopupButton.Text = "X"
+ClosePopupButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ClosePopupButton.TextSize = 14
+ClosePopupButton.Font = Enum.Font.GothamBold
+ClosePopupButton.ZIndex = 12
+ClosePopupButton.Parent = AntiAllPopup
+addCorner(ClosePopupButton, 8)
+
+-- Helper to build toggle rows
+local function makeAntiToggle(name, text, y)
+    local btn = Instance.new("TextButton")
+    btn.Name = name
+    btn.Size = UDim2.new(1, -28, 0, 38)
+    btn.Position = UDim2.new(0, 14, 0, y)
+    btn.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    btn.BorderSizePixel = 0
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.TextSize = 13
+    btn.Font = Enum.Font.GothamSemibold
+    btn.ZIndex = 11
+    btn.Parent = AntiAllPopup
+    addCorner(btn, 10)
+    addStroke(btn, Color3.fromRGB(160, 80, 220), 1, 0.75)
+    return btn
+end
+
+AntiAFKToggle = makeAntiToggle("AntiAFKToggle", "ANTI AFK: OFF", 52)
+AntiSitToggle = makeAntiToggle("AntiSitToggle", "ANTI SIT: OFF", 100)
+AntiVoidToggle = makeAntiToggle("AntiVoidToggle", "ANTI VOID: OFF", 148)
+AntiGameplayToggle = makeAntiToggle("AntiGameplayToggle", "ANTI PAUSED: OFF", 196)
+
+local AntiAllHint = Instance.new("TextLabel")
+AntiAllHint.Size = UDim2.new(1, -28, 0, 28)
+AntiAllHint.Position = UDim2.new(0, 14, 0, 250)
+AntiAllHint.BackgroundTransparency = 1
+AntiAllHint.Text = "Drag the title bar to move this window"
+AntiAllHint.TextColor3 = Color3.fromRGB(120, 130, 160)
+AntiAllHint.TextSize = 11
+AntiAllHint.Font = Enum.Font.Gotham
+AntiAllHint.ZIndex = 11
+AntiAllHint.Parent = AntiAllPopup
+
+-- Make Anti All popup movable via title bar
+do
+    local popupDragging = false
+    local popupDragStart = Vector2.new()
+    local popupStartPos = UDim2.new()
+
+    AntiAllTitle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            popupDragging = true
+            popupDragStart = Vector2.new(input.Position.X, input.Position.Y)
+            popupStartPos = AntiAllPopup.Position
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            popupDragging = false
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not popupDragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local delta = Vector2.new(input.Position.X, input.Position.Y) - popupDragStart
+        AntiAllPopup.Position = UDim2.new(
+            popupStartPos.X.Scale, popupStartPos.X.Offset + delta.X,
+            popupStartPos.Y.Scale, popupStartPos.Y.Offset + delta.Y
+        )
+    end)
+end
+
+-- TP To Map Button
+TPMapButton = Instance.new("TextButton")
+TPMapButton.Name = "TPMapButton"
+TPMapButton.Size = UDim2.new(0.85, 0, 0, 50)
+TPMapButton.Position = UDim2.new(0.075, 0, 0, 310)
+TPMapButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+TPMapButton.BorderSizePixel = 0
+TPMapButton.Text = "TP TO MAP"
+TPMapButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+TPMapButton.TextSize = 14
+TPMapButton.Font = Enum.Font.GothamSemibold
+TPMapButton.Parent = SettingsContent
+
+addCorner(TPMapButton, 10)
+
+addStroke(TPMapButton, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+addStroke(RejoinButton, Color3.fromRGB(140, 80, 200), 1, 0.5)
+
+-- Shaders Section
+ShaderButton = Instance.new("TextButton")
+ShaderButton.Name = "ShaderButton"
+ShaderButton.Size = UDim2.new(0.85, 0, 0, 50)
+ShaderButton.Position = UDim2.new(0.075, 0, 0, 370)
+ShaderButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+ShaderButton.BorderSizePixel = 0
+ShaderButton.Text = "SHADERS: OFF"
+ShaderButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ShaderButton.TextSize = 14
+ShaderButton.Font = Enum.Font.GothamSemibold
+ShaderButton.Parent = SettingsContent
+
+addCorner(ShaderButton, 10)
+
+addStroke(ShaderButton, Color3.fromRGB(160, 80, 220), 1, 0.8)
+
+ShaderPresets = {
+    { name = "Purple", tint = Color3.fromRGB(165, 85, 255) },
+    { name = "Dark",   tint = Color3.fromRGB(40, 40, 60) },
+    { name = "Day",    tint = Color3.fromRGB(255, 240, 220) },
+    { name = "Sunset", tint = Color3.fromRGB(255, 120, 80) },
+}
+
+ShaderPresetButtons = {}
+for i, preset in ipairs(ShaderPresets) do
+    local btn = Instance.new("TextButton")
+    btn.Name = "ShaderPreset_" .. preset.name
+    btn.Size = UDim2.new(0.2, 0, 0, 36)
+    btn.Position = UDim2.new(0.05 + (i - 1) * 0.23, 0, 0, 430)
+    btn.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    btn.BorderSizePixel = 0
+    btn.Text = preset.name
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.TextSize = 12
+    btn.Font = Enum.Font.GothamSemibold
+    btn.Parent = SettingsContent
+    addCorner(btn, 8)
+    addStroke(btn, Color3.fromRGB(160, 80, 220), 1, 0.8)
+    ShaderPresetButtons[i] = { button = btn, tint = preset.tint, name = preset.name }
+end
+
+-- (shader functions moved below)
+
+
+end
+
+local snapshotShaders, clearShaderEffects, restoreShaders, applyShaders, setShadersEnabled, setShaderTint
+-- Shader functions
+snapshotShaders = function()
+    ShaderSnap = {
+        Brightness = Lighting.Brightness,
+        ExposureCompensation = Lighting.ExposureCompensation,
+        ClockTime = Lighting.ClockTime,
+        Ambient = Lighting.Ambient,
+        OutdoorAmbient = Lighting.OutdoorAmbient,
+    }
+end
+
+clearShaderEffects = function()
+    for _, v in ipairs(Lighting:GetChildren()) do
+        if v:IsA("Sky") or v:IsA("BloomEffect") or v:IsA("BlurEffect")
+            or v:IsA("ColorCorrectionEffect") or v:IsA("SunRaysEffect") or v:IsA("Atmosphere") then
+            v:Destroy()
+        end
+    end
+end
+
+restoreShaders = function()
+    if ShaderSnap then
+        Lighting.Brightness = ShaderSnap.Brightness
+        Lighting.ExposureCompensation = ShaderSnap.ExposureCompensation
+        Lighting.ClockTime = ShaderSnap.ClockTime
+        Lighting.Ambient = ShaderSnap.Ambient
+        Lighting.OutdoorAmbient = ShaderSnap.OutdoorAmbient
+    end
+    clearShaderEffects()
+end
+
+applyShaders = function(tint)
+    clearShaderEffects()
+    local cfg = SHADER_CONFIG
+    tint = tint or ShaderTint or cfg.Tint
+    ShaderTint = tint
+    Lighting.Brightness = cfg.Brightness
+    Lighting.ExposureCompensation = cfg.Exposure
+    Lighting.ClockTime = cfg.ClockTime
+    Lighting.Ambient = tint
+    Lighting.OutdoorAmbient = tint
+
+    local sky = Instance.new("Sky")
+    sky.SkyboxBk = cfg.SkyboxBk
+    sky.SkyboxDn = cfg.SkyboxDn
+    sky.SkyboxFt = cfg.SkyboxFt
+    sky.SkyboxLf = cfg.SkyboxLf
+    sky.SkyboxRt = cfg.SkyboxRt
+    sky.SkyboxUp = cfg.SkyboxUp
+    sky.StarCount = cfg.StarCount
+    sky.SunAngularSize = cfg.SunAngularSize
+    if cfg.HeartSun and cfg.SunTextureId and cfg.SunTextureId ~= "" then
+        sky.SunTextureId = cfg.SunTextureId
+    end
+    sky.Parent = Lighting
+
+    local bloom = Instance.new("BloomEffect")
+    bloom.Intensity = cfg.BloomIntensity
+    bloom.Size = cfg.BloomSize
+    bloom.Threshold = cfg.BloomThreshold
+    bloom.Parent = Lighting
+
+    local blur = Instance.new("BlurEffect")
+    blur.Size = cfg.BlurSize
+    blur.Parent = Lighting
+
+    local cc = Instance.new("ColorCorrectionEffect")
+    cc.Brightness = cfg.CCBrightness
+    cc.Contrast = cfg.CCContrast
+    cc.Saturation = cfg.CCSaturation
+    cc.TintColor = tint
+    cc.Parent = Lighting
+
+    local sr = Instance.new("SunRaysEffect")
+    sr.Intensity = cfg.SunRaysIntensity
+    sr.Spread = cfg.SunRaysSpread
+    sr.Parent = Lighting
+end
+
+setShadersEnabled = function(v)
+    local ok, err = pcall(function()
+        if v then
+            applyShaders(ShaderTint)
+        else
+            restoreShaders()
+        end
+    end)
+    if not ok then
+        warn("[AETHER] Shader error: ", err)
+        ShaderEnabled = false
+        ShaderButton.Text = "SHADERS: OFF"
+        ShaderButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        return
+    end
+    ShaderEnabled = v
+    if v then
+        ShaderButton.Text = "SHADERS: ON"
+        ShaderButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+    else
+        ShaderButton.Text = "SHADERS: OFF"
+        ShaderButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    end
+end
+
+setShaderTint = function(col)
+    ShaderTint = col
+    if ShaderEnabled then
+        pcall(function()
+            local cc = Lighting:FindFirstChildOfClass("ColorCorrectionEffect")
+            if cc then cc.TintColor = col end
+            Lighting.Ambient = col
+            Lighting.OutdoorAmbient = col
+        end)
+    end
+end
+
+
+-- HSV helper
+local function hsvToRgb(h, s, v)
+    h = h % 1
+    local i = math.floor(h * 6)
+    local f = h * 6 - i
+    local p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+    i = i % 6
+    if i == 0 then return v, t, p
+    elseif i == 1 then return q, v, p
+    elseif i == 2 then return p, v, t
+    elseif i == 3 then return p, q, v
+    elseif i == 4 then return t, p, v
+    else return v, p, q end
+end
+
+-- Full color wheel for shaders
+do
+    local card = Instance.new("Frame")
+    card.Name = "ShaderColorWheel"
+    card.Size = UDim2.new(0.9, 0, 0, 130)
+    card.Position = UDim2.new(0.05, 0, 0, 480)
+    card.BackgroundColor3 = Color3.fromRGB(20, 22, 36)
+    card.BorderSizePixel = 0
+    card.Parent = SettingsContent
+    addCorner(card, 12)
+    addStroke(card, Color3.fromRGB(160, 80, 220), 1, 0.6)
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -20, 0, 16)
+    title.Position = UDim2.new(0, 10, 0, 4)
+    title.BackgroundTransparency = 1
+    title.Text = "SHADER TINT"
+    title.TextColor3 = Color3.fromRGB(200, 100, 255)
+    title.TextSize = 11
+    title.Font = Enum.Font.GothamBold
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = card
+
+    local wheel = Instance.new("Frame")
+    wheel.Size = UDim2.new(0, 90, 0, 90)
+    wheel.Position = UDim2.new(0, 12, 0, 26)
+    wheel.BackgroundColor3 = Color3.fromRGB(16, 16, 24)
+    wheel.BorderSizePixel = 0
+    wheel.Parent = card
+    addCorner(wheel, 999)
+    addStroke(wheel, Color3.fromRGB(80, 70, 120), 1, 0.4)
+
+    local ring = Instance.new("Frame")
+    ring.Size = UDim2.new(1, -8, 1, -8)
+    ring.Position = UDim2.new(0, 4, 0, 4)
+    ring.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    ring.BorderSizePixel = 0
+    ring.Parent = wheel
+    addCorner(ring, 999)
+
+    local grad = Instance.new("UIGradient")
+    grad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
+        ColorSequenceKeypoint.new(0.17, Color3.fromRGB(255, 255, 0)),
+        ColorSequenceKeypoint.new(0.33, Color3.fromRGB(0, 255, 0)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(0, 255, 255)),
+        ColorSequenceKeypoint.new(0.67, Color3.fromRGB(0, 0, 255)),
+        ColorSequenceKeypoint.new(0.83, Color3.fromRGB(255, 0, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 0, 0)),
+    })
+    grad.Parent = ring
+
+    local selector = Instance.new("Frame")
+    selector.Size = UDim2.new(0, 10, 0, 10)
+    selector.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    selector.BorderSizePixel = 0
+    selector.ZIndex = 6
+    selector.Parent = wheel
+    addCorner(selector, 999)
+    addStroke(selector, Color3.fromRGB(0, 0, 0), 1.5, 0)
+
+    local center = Instance.new("Frame")
+    center.Size = UDim2.new(0, 22, 0, 22)
+    center.Position = UDim2.new(0.5, -11, 0.5, -11)
+    center.BackgroundColor3 = ShaderTint
+    center.BorderSizePixel = 0
+    center.ZIndex = 5
+    center.Parent = wheel
+    addCorner(center, 999)
+    addStroke(center, Color3.fromRGB(200, 100, 255), 1.5, 0)
+
+    -- Value (brightness) slider
+    local valSlider = Instance.new("Frame")
+    valSlider.Size = UDim2.new(0, 12, 0, 90)
+    valSlider.Position = UDim2.new(0, 112, 0, 26)
+    valSlider.BackgroundColor3 = Color3.fromRGB(30, 32, 48)
+    valSlider.BorderSizePixel = 0
+    valSlider.Parent = card
+    addCorner(valSlider, 999)
+    addStroke(valSlider, Color3.fromRGB(80, 70, 120), 1, 0.5)
+
+    local valGrad = Instance.new("UIGradient")
+    valGrad.Rotation = 90
+    valGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 0, 0)),
+    })
+    valGrad.Parent = valSlider
+
+    local valKnob = Instance.new("Frame")
+    valKnob.Size = UDim2.new(1, 6, 0, 10)
+    valKnob.Position = UDim2.new(0, -3, 0, 0)
+    valKnob.BackgroundColor3 = Color3.fromRGB(200, 100, 255)
+    valKnob.BorderSizePixel = 0
+    valKnob.ZIndex = 5
+    valKnob.Parent = valSlider
+    addCorner(valKnob, 4)
+
+    local hexLabel = Instance.new("TextLabel")
+    hexLabel.Size = UDim2.new(1, -140, 0, 18)
+    hexLabel.Position = UDim2.new(0, 136, 0, 30)
+    hexLabel.BackgroundTransparency = 1
+    hexLabel.Text = "#A555FF"
+    hexLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    hexLabel.Font = Enum.Font.GothamBold
+    hexLabel.TextSize = 13
+    hexLabel.TextXAlignment = Enum.TextXAlignment.Left
+    hexLabel.Parent = card
+
+    local rgbLabel = Instance.new("TextLabel")
+    rgbLabel.Size = UDim2.new(1, -140, 0, 14)
+    rgbLabel.Position = UDim2.new(0, 136, 0, 50)
+    rgbLabel.BackgroundTransparency = 1
+    rgbLabel.Text = "165, 85, 255"
+    rgbLabel.TextColor3 = Color3.fromRGB(150, 160, 190)
+    rgbLabel.Font = Enum.Font.Gotham
+    rgbLabel.TextSize = 11
+    rgbLabel.TextXAlignment = Enum.TextXAlignment.Left
+    rgbLabel.Parent = card
+
+    local prevLabel = Instance.new("TextLabel")
+    prevLabel.Size = UDim2.new(1, -140, 0, 12)
+    prevLabel.Position = UDim2.new(0, 136, 0, 70)
+    prevLabel.BackgroundTransparency = 1
+    prevLabel.Text = "PREVIEW"
+    prevLabel.TextColor3 = Color3.fromRGB(100, 110, 140)
+    prevLabel.Font = Enum.Font.GothamBold
+    prevLabel.TextSize = 9
+    prevLabel.TextXAlignment = Enum.TextXAlignment.Left
+    prevLabel.Parent = card
+
+    local prevSwatch = Instance.new("Frame")
+    prevSwatch.Size = UDim2.new(0, 48, 0, 24)
+    prevSwatch.Position = UDim2.new(0, 136, 0, 86)
+    prevSwatch.BackgroundColor3 = ShaderTint
+    prevSwatch.BorderSizePixel = 0
+    prevSwatch.Parent = card
+    addCorner(prevSwatch, 6)
+    addStroke(prevSwatch, Color3.fromRGB(160, 80, 220), 1, 0.4)
+
+    -- HSV state from initial tint
+    local h, s, v = 0, 1, 1
+    do
+        local r, g, b = ShaderTint.R, ShaderTint.G, ShaderTint.B
+        local maxc = math.max(r, g, b)
+        local minc = math.min(r, g, b)
+        v = maxc
+        local d = maxc - minc
+        s = (maxc == 0) and 0 or (d / maxc)
+        if d == 0 then
+            h = 0
+        elseif maxc == r then
+            h = ((g - b) / d) % 6
+        elseif maxc == g then
+            h = (b - r) / d + 2
+        else
+            h = (r - g) / d + 4
+        end
+        h = h / 6
+    end
+
+    local function updateVisual()
+        local radius = (wheel.AbsoluteSize.X / 2) - 10
+        if radius < 1 then radius = 35 end
+        local angle = (h - 0.5) * math.pi * 2
+        local x = math.cos(angle) * radius * s
+        local y = math.sin(angle) * radius * s
+        selector.Position = UDim2.new(0.5, x - 5, 0.5, y - 5)
+    end
+
+    local function push()
+        local r, g, b = hsvToRgb(h, s, v)
+        local col = Color3.new(r, g, b)
+        center.BackgroundColor3 = col
+        prevSwatch.BackgroundColor3 = col
+        hexLabel.Text = string.format("#%02X%02X%02X", math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
+        rgbLabel.Text = string.format("%d, %d, %d", math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
+        updateVisual()
+        setShaderTint(col)
+        if SHADER_CONFIG.AutoEnableOnTint and not ShaderEnabled then
+            setShadersEnabled(true)
+        end
+    end
+
+    local draggingWheel, draggingVal = false, false
+
+    wheel.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            draggingWheel = true
+            ColorWheelActive = true
+            local rel = Vector2.new(input.Position.X, input.Position.Y) - wheel.AbsolutePosition - wheel.AbsoluteSize / 2
+            s = math.clamp(rel.Magnitude / math.max((wheel.AbsoluteSize.X / 2) - 7, 1), 0, 1)
+            h = (math.atan2(rel.Y, rel.X) / (math.pi * 2) + 0.5) % 1
+            push()
+        end
+    end)
+
+    valSlider.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            draggingVal = true
+            ColorWheelActive = true
+            local relY = input.Position.Y - valSlider.AbsolutePosition.Y
+            v = 1 - math.clamp(relY / math.max(valSlider.AbsoluteSize.Y, 1), 0, 1)
+            valKnob.Position = UDim2.new(0, -3, 0, (1 - v) * (valSlider.AbsoluteSize.Y - 10))
+            push()
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            draggingWheel = false
+            draggingVal = false
+            ColorWheelActive = false
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+        if draggingWheel then
+            local rel = Vector2.new(input.Position.X, input.Position.Y) - wheel.AbsolutePosition - wheel.AbsoluteSize / 2
+            s = math.clamp(rel.Magnitude / math.max((wheel.AbsoluteSize.X / 2) - 7, 1), 0, 1)
+            h = (math.atan2(rel.Y, rel.X) / (math.pi * 2) + 0.5) % 1
+            push()
+        elseif draggingVal then
+            local relY = input.Position.Y - valSlider.AbsolutePosition.Y
+            v = 1 - math.clamp(relY / math.max(valSlider.AbsoluteSize.Y, 1), 0, 1)
+            valKnob.Position = UDim2.new(0, -3, 0, (1 - v) * (valSlider.AbsoluteSize.Y - 10))
+            push()
+        end
+    end)
+
+    task.defer(function()
+        valKnob.Position = UDim2.new(0, -3, 0, (1 - v) * 80)
+        updateVisual()
+        local r, g, b = hsvToRgb(h, s, v)
+        local col = Color3.new(r, g, b)
+        center.BackgroundColor3 = col
+        prevSwatch.BackgroundColor3 = col
+        hexLabel.Text = string.format("#%02X%02X%02X", math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
+        rgbLabel.Text = string.format("%d, %d, %d", math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
+    end)
+end
+
+
+
+-- Config save/load UI
+do
+    local cfgTitle = Instance.new("TextLabel")
+    cfgTitle.Size = UDim2.new(0.9, 0, 0, 18)
+    cfgTitle.Position = UDim2.new(0.05, 0, 0, 130)
+    cfgTitle.BackgroundTransparency = 1
+    cfgTitle.Text = "CONFIGS"
+    cfgTitle.TextColor3 = Color3.fromRGB(200, 100, 255)
+    cfgTitle.TextSize = 12
+    cfgTitle.Font = Enum.Font.GothamBold
+    cfgTitle.TextXAlignment = Enum.TextXAlignment.Left
+    cfgTitle.Parent = SettingsTabContent
+
+    ConfigNameBox = Instance.new("TextBox")
+    ConfigNameBox.Name = "ConfigNameBox"
+    ConfigNameBox.Size = UDim2.new(0.9, 0, 0, 36)
+    ConfigNameBox.Position = UDim2.new(0.05, 0, 0, 154)
+    ConfigNameBox.BackgroundColor3 = Color3.fromRGB(28, 30, 48)
+    ConfigNameBox.BorderSizePixel = 0
+    ConfigNameBox.Text = CurrentConfigName
+    ConfigNameBox.PlaceholderText = "config name..."
+    ConfigNameBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ConfigNameBox.PlaceholderColor3 = Color3.fromRGB(120, 130, 160)
+    ConfigNameBox.TextSize = 13
+    ConfigNameBox.Font = Enum.Font.Gotham
+    ConfigNameBox.ClearTextOnFocus = false
+    ConfigNameBox.Parent = SettingsTabContent
+    addCorner(ConfigNameBox, 8)
+    addStroke(ConfigNameBox, Color3.fromRGB(160, 80, 220), 1, 0.7)
+
+    SaveConfigButton = Instance.new("TextButton")
+    SaveConfigButton.Name = "SaveConfigButton"
+    SaveConfigButton.Size = UDim2.new(0.43, 0, 0, 40)
+    SaveConfigButton.Position = UDim2.new(0.05, 0, 0, 200)
+    SaveConfigButton.BackgroundColor3 = Color3.fromRGB(60, 140, 90)
+    SaveConfigButton.BorderSizePixel = 0
+    SaveConfigButton.Text = "SAVE CONFIG"
+    SaveConfigButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SaveConfigButton.TextSize = 13
+    SaveConfigButton.Font = Enum.Font.GothamSemibold
+    SaveConfigButton.Parent = SettingsTabContent
+    addCorner(SaveConfigButton, 10)
+    addStroke(SaveConfigButton, Color3.fromRGB(80, 200, 120), 1, 0.5)
+
+    LoadConfigButton = Instance.new("TextButton")
+    LoadConfigButton.Name = "LoadConfigButton"
+    LoadConfigButton.Size = UDim2.new(0.43, 0, 0, 40)
+    LoadConfigButton.Position = UDim2.new(0.52, 0, 0, 200)
+    LoadConfigButton.BackgroundColor3 = Color3.fromRGB(60, 90, 160)
+    LoadConfigButton.BorderSizePixel = 0
+    LoadConfigButton.Text = "LOAD CONFIG"
+    LoadConfigButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    LoadConfigButton.TextSize = 13
+    LoadConfigButton.Font = Enum.Font.GothamSemibold
+    LoadConfigButton.Parent = SettingsTabContent
+    addCorner(LoadConfigButton, 10)
+    addStroke(LoadConfigButton, Color3.fromRGB(100, 140, 220), 1, 0.5)
+
+    ConfigStatusLabel = Instance.new("TextLabel")
+    ConfigStatusLabel.Size = UDim2.new(0.9, 0, 0, 28)
+    ConfigStatusLabel.Position = UDim2.new(0.05, 0, 0, 250)
+    ConfigStatusLabel.BackgroundTransparency = 1
+    ConfigStatusLabel.Text = "Saves fly speed, boost, anti toggles, shaders"
+    ConfigStatusLabel.TextColor3 = Color3.fromRGB(120, 130, 160)
+    ConfigStatusLabel.TextSize = 11
+    ConfigStatusLabel.Font = Enum.Font.Gotham
+    ConfigStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    ConfigStatusLabel.TextWrapped = true
+    ConfigStatusLabel.Parent = SettingsTabContent
+end
+
+
+pcall(snapshotShaders)
+
+-- Fly logic
+local BodyVelocity
+local BodyGyro
+local OriginalJumpPower
+local OriginalJumpHeight
+local OriginalAutoJumpEnabled
+
+-- Attachment logic
+local AttachmentVelocity
+local AttachmentLoop
+local OriginalWalkSpeed
+
+-- Respawn teleport
+local SavedPosition
+local RespawnTPEnabled = false
+
+-- Spectate
+local SpectateActive = false
+local OriginalCameraSubject
+
+-- Anti All
+local AntiAllEnabled = false
+local AntiAFKEnabled = false
+local AntiSitEnabled = false
+local AntiVoidEnabled = false
+local AntiGameplayPausedEnabled = false
+
+-- Air Walk logic
+local AirWalkPart
+local AirWalkTargetY
+local AirWalkBodyPosition
+
+local function EnableFly()
+    if not Flying then
+        Flying = true
+        FlyButton.Text = "FLY: ON"
+        FlyButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+        CurrentVelocity = Vector3.new() -- Reset velocity
+        
+        -- Store and disable jump
+        OriginalJumpPower = Humanoid.JumpPower
+        OriginalJumpHeight = Humanoid.UseJumpPower and Humanoid.JumpHeight or 0
+        OriginalAutoJumpEnabled = Humanoid.AutoJumpEnabled
+        Humanoid.JumpPower = 0
+        Humanoid.JumpHeight = 0
+        Humanoid.UseJumpPower = false
+        Humanoid.AutoJumpEnabled = false
+        
+        BodyVelocity = Instance.new("BodyVelocity")
+        BodyVelocity.Name = "FlyVelocity"
+        BodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+        BodyVelocity.Velocity = Vector3.new(0, 0, 0)
+        BodyVelocity.Parent = RootPart
+        
+        BodyGyro = Instance.new("BodyGyro")
+        BodyGyro.Name = "FlyGyro"
+        BodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+        BodyGyro.P = 10000
+        BodyGyro.Parent = RootPart
+        
+        Humanoid.PlatformStand = true
+    end
+end
+
+local function DisableFly()
+    if Flying then
+        Flying = false
+        FlyButton.Text = "FLY: OFF"
+        FlyButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        CurrentVelocity = Vector3.new() -- Reset velocity
+        
+        -- Restore jump settings
+        if OriginalJumpPower then
+            Humanoid.JumpPower = OriginalJumpPower
+        end
+        if OriginalJumpHeight then
+            Humanoid.JumpHeight = OriginalJumpHeight
+        end
+        if OriginalAutoJumpEnabled ~= nil then
+            Humanoid.AutoJumpEnabled = OriginalAutoJumpEnabled
+        end
+        Humanoid.UseJumpPower = true
+        
+        if BodyVelocity then
+            BodyVelocity:Destroy()
+            BodyVelocity = nil
+        end
+        
+        if BodyGyro then
+            BodyGyro:Destroy()
+            BodyGyro = nil
+        end
+        
+        Humanoid.PlatformStand = false
+    end
+end
+
+-- Speed logic
+local function EnableSpeed()
+    if not SpeedBoost then
+        SpeedBoost = true
+        SpeedButton.Text = "SPEED: ON"
+        SpeedButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+        Humanoid.WalkSpeed = BoostSpeed
+    end
+end
+
+local function DisableSpeed()
+    if SpeedBoost then
+        SpeedBoost = false
+        SpeedButton.Text = "SPEED: OFF"
+        SpeedButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        Humanoid.WalkSpeed = NormalSpeed
+    end
+end
+
+-- Air Walk logic
+local function EnableAirWalk()
+    if not AirWalk then
+        AirWalk = true
+        AirWalkButton.Text = "AIR WALK: ON"
+        AirWalkButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+        
+        -- Capture current Y position to lock height
+        AirWalkTargetY = RootPart.Position.Y
+        
+        AirWalkPart = Instance.new("Part")
+        AirWalkPart.Name = "AirWalkPlatform"
+        AirWalkPart.Size = Vector3.new(512, 1, 512) -- large transparent baseplate
+        AirWalkPart.Transparency = 1
+        AirWalkPart.Anchored = true
+        AirWalkPart.CanCollide = true
+        AirWalkPart.CanQuery = false
+        AirWalkPart.Material = Enum.Material.SmoothPlastic
+        AirWalkPart.Parent = Workspace
+    end
+end
+
+local function DisableAirWalk()
+    if AirWalk then
+        AirWalk = false
+        AirWalkButton.Text = "AIR WALK: OFF"
+        AirWalkButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        
+        if AirWalkPart then
+            AirWalkPart:Destroy()
+            AirWalkPart = nil
+        end
+    end
+end
+
+local function EnableNoclip()
+    if not Noclip then
+        Noclip = true
+        NoclipButton.Text = "NOCLIP: ON"
+        NoclipButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+    end
+end
+
+local function DisableNoclip()
+    if Noclip then
+        Noclip = false
+        NoclipButton.Text = "NOCLIP: OFF"
+        NoclipButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        if Character then
+            for _, part in pairs(Character:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = true
+                end
+            end
+        end
+    end
+end
+
+-- Button handlers
+FlyButton.MouseButton1Click:Connect(function()
+    if Flying then
+        DisableFly()
+    else
+        EnableFly()
+    end
+end)
+
+SpeedButton.MouseButton1Click:Connect(function()
+    if SpeedBoost then
+        DisableSpeed()
+    else
+        EnableSpeed()
+    end
+end)
+
+AirWalkButton.MouseButton1Click:Connect(function()
+    if AirWalk then
+        DisableAirWalk()
+    else
+        EnableAirWalk()
+    end
+end)
+
+NoclipButton.MouseButton1Click:Connect(function()
+    if Noclip then
+        DisableNoclip()
+    else
+        EnableNoclip()
+    end
+end)
+
+TPToolButton.MouseButton1Click:Connect(function()
+    TPToolActive = not TPToolActive
+    if TPToolActive then
+        TPToolButton.Text = "TP TOOL: ON"
+        TPToolButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+        
+        -- Create TP tool
+        TPToolInstance = Instance.new("Tool")
+        TPToolInstance.Name = "TP Tool"
+        TPToolInstance.RequiresHandle = false
+        TPToolInstance.Parent = Player.Backpack
+        
+        -- Tool activated handler
+        TPToolInstance.Activated:Connect(function()
+            if RootPart and Mouse then
+                local targetPos = Mouse.Hit.Position
+                if AirWalk and AirWalkPart then
+                    -- Stay at current air-walk height; move only XZ so you land on the platform instead of the void
+                    local newPos = Vector3.new(targetPos.X, AirWalkTargetY, targetPos.Z)
+                    RootPart.CFrame = CFrame.new(newPos)
+                    AirWalkPart.Position = Vector3.new(newPos.X, AirWalkTargetY - 3.5, newPos.Z)
+                else
+                    RootPart.CFrame = CFrame.new(targetPos)
+                end
+            end
+        end)
+    else
+        TPToolButton.Text = "TP TOOL: OFF"
+        TPToolButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        
+        -- Destroy TP tool
+        if TPToolInstance then
+            TPToolInstance:Destroy()
+            TPToolInstance = nil
+        end
+    end
+end)
+
+DestroyButton.MouseButton1Click:Connect(function()
+    ScriptActive = false
+    
+    -- Disable all features
+    DisableFly()
+    DisableSpeed()
+    DisableAirWalk()
+    DisableNoclip()
+    if ShaderEnabled then
+        pcall(function() setShadersEnabled(false) end)
+    end
+    
+    -- Clean up attachment
+    AttachmentLoop = false
+    if AttachmentVelocity then
+        AttachmentVelocity:Destroy()
+        AttachmentVelocity = nil
+    end
+    Humanoid.Sit = false
+    Humanoid.PlatformStand = false
+    if OriginalWalkSpeed then
+        Humanoid.WalkSpeed = OriginalWalkSpeed
+    end
+    
+    -- Clean up TP tool
+    TPToolActive = false
+    if TPToolInstance then
+        TPToolInstance:Destroy()
+        TPToolInstance = nil
+    end
+    
+    -- Reset respawn TP
+    RespawnTPEnabled = false
+    SavedPosition = nil
+    
+    -- Reset other state
+    SelectedPlayer = nil
+    AttachmentMode = nil
+    FlingActive = false
+    
+    -- Reset spectate
+    SpectateActive = false
+    if OriginalCameraSubject then
+        workspace.CurrentCamera.CameraSubject = OriginalCameraSubject
+    else
+        workspace.CurrentCamera.CameraSubject = Player.Character.Humanoid
+    end
+    
+    -- Reset button states
+    ViewButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    ViewButton.Text = "VIEW"
+    PlayerNameInput.Text = ""
+    VCButton.Text = "VC BYPASS"
+    VCButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    AntiAllButton.Text = "ANTI ALL"
+    AntiAllButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    AntiAllPopup.Visible = false
+    AntiAFKToggle.Text = "ANTI AFK: OFF"
+    AntiAFKToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    AntiSitToggle.Text = "ANTI SIT: OFF"
+    AntiSitToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    AntiVoidToggle.Text = "ANTI VOID: OFF"
+    AntiVoidToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    AntiGameplayToggle.Text = "ANTI PAUSED: OFF"
+    AntiGameplayToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    
+    -- Reset anti all
+    AntiAllEnabled = false
+    AntiAFKEnabled = false
+    AntiSitEnabled = false
+    AntiVoidEnabled = false
+    AntiGameplayPausedEnabled = false
+    
+    pcall(function() ScreenGui:Destroy() end)
+    pcall(function() if script then script:Destroy() end end)
+end)
+
+RejoinButton.MouseButton1Click:Connect(function()
+    TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId)
+end)
+
+-- Respawn TP button handler
+RespawnTPButton.MouseButton1Click:Connect(function()
+    RespawnTPEnabled = not RespawnTPEnabled
+    if RespawnTPEnabled then
+        RespawnTPButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+        RespawnTPButton.Text = "RESPAWN TP: ON"
+    else
+        RespawnTPButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        RespawnTPButton.Text = "RESPAWN TP: OFF"
+    end
+end)
+
+-- VC Bypass function
+local function runAVCB()
+    local clonereference = cloneref or function(...) return ... end
+    local clonefunction = clonefunction or function(...) return ... end
+
+    local voicechatservice = clonereference(game:GetService("VoiceChatService"))
+    local voicechatinternal = clonereference(game:GetService("VoiceChatInternal"))
+    local coregui = game:GetService("CoreGui")
+    local startergui = game:GetService("StarterGui")
+    local getconnectionsfunc = clonefunction(getconnections)
+
+    local mutedimage = "rbxasset://textures/ui/VoiceChat/MicLight/Muted.png"
+    local ismuted = true
+    local hiddenfolder = Instance.new("Folder", game:GetService("RobloxReplicatedStorage"))
+
+    local topbarapp = coregui:WaitForChild("TopBarApp", 15):WaitForChild("TopBarApp", 15)
+    local unibarleft = topbarapp:WaitForChild("UnibarLeftFrame", 15)
+    local unibarmenu = unibarleft:WaitForChild("UnibarMenu", 15) or unibarleft:WaitForChild("ChromeMenu", 15)
+    local unibarcontainer
+
+    local function getunibarcontainer()
+        if not unibarmenu then return nil end
+        local frame = unibarmenu:WaitForChild("2", 15)
+        if not frame then return nil end
+        local unibar = frame:FindFirstChild("Unibar") or frame
+        return unibar:WaitForChild("3", 15)
+    end
+
+    local function findmicbutton()
+        if unibarcontainer then
+            local found = unibarcontainer:FindFirstChild("toggle_mic_mute", true)
+            if found then return found end
+        end
+        if unibarmenu then return unibarmenu:FindFirstChild("toggle_mic_mute", true) end
+        return nil
+    end
+
+    pcall(function()
+        unibarcontainer = getunibarcontainer()
+    end)
+
+    local micmutebutton = findmicbutton()
+
+    local function geticonlabel(button)
+        button = button or micmutebutton
+        local frame = button:WaitForChild("IntegrationIconFrame", 15)
+        local container = frame:WaitForChild("IntegrationIcon", 15)
+        return container:FindFirstChild("1") or frame:FindFirstChildOfClass("ImageLabel") or frame:FindFirstChildOfClass("ImageButton")
+    end
+
+    local function setmutestate(state)
+        pcall(function()
+            voicechatinternal:PublishPause(state)
+        end)
+    end
+
+    if not micmutebutton then 
+        voicechatservice:joinVoice() 
+        pcall(function()
+            unibarcontainer = getunibarcontainer()
+            micmutebutton = unibarcontainer and unibarcontainer:WaitForChild("toggle_mic_mute", 15) or findmicbutton()
+        end)
+    end
+
+    if not micmutebutton then return false, "Mic button not found" end
+
+    startergui:SetCore("SendNotification", {Title = "VC Bypass", Text = "Unmute to continue.", Duration = 5})
+
+    repeat task.wait(2) until geticonlabel().Image ~= mutedimage
+
+    voicechatservice:leaveVoice()
+    task.wait(2)
+
+    local connections = getconnectionsfunc(voicechatinternal.StateChanged)
+    for i = 7, #connections do 
+        if connections[i] then connections[i]:Disable() end
+    end
+
+    task.wait(2)
+    voicechatservice:joinVoice()
+
+    pcall(function()
+        unibarcontainer = getunibarcontainer()
+        micmutebutton = unibarcontainer and unibarcontainer:WaitForChild("toggle_mic_mute", 15) or findmicbutton()
+    end)
+
+    if micmutebutton and unibarcontainer then
+        local clonedmutebutton = micmutebutton:Clone()
+        micmutebutton.Parent = hiddenfolder
+        clonedmutebutton.Name = "toggle_mic_mute_new"
+        clonedmutebutton.Parent = unibarcontainer
+
+        local clonedicon = geticonlabel(clonedmutebutton)
+        local originalicon = geticonlabel(micmutebutton)
+
+        setmutestate(true)
+        clonedmutebutton:WaitForChild("IconHitArea_toggle_mic_mute", 15).Activated:Connect(function()
+            ismuted = not ismuted
+            setmutestate(ismuted)
+            if ismuted then
+                clonedicon.Image = mutedimage
+            else
+                clonedicon.Image = originalicon.Image
+            end
+        end)
+    end
+
+    return true, "ok"
+end
+
+-- VC Bypass button handler
+VCButton.MouseButton1Click:Connect(function()
+    VCButton.Text = "RUNNING..."
+    task.spawn(function()
+        local ok, reason = runAVCB()
+        if ok then
+            VCButton.Text = "VC BYPASS: ON"
+            VCButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+        else
+            VCButton.Text = "VC BYPASS: FAILED"
+            VCButton.BackgroundColor3 = Color3.fromRGB(220, 55, 70)
+        end
+    end)
+end)
+
+-- Anti All button handler
+AntiAllButton.MouseButton1Click:Connect(function()
+    AntiAllPopup.Visible = not AntiAllPopup.Visible
+end)
+
+-- Anti AFK toggle handler
+AntiAFKToggle.MouseButton1Click:Connect(function()
+    AntiAFKEnabled = not AntiAFKEnabled
+    if AntiAFKEnabled then
+        AntiAFKToggle.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+        AntiAFKToggle.Text = "ANTI AFK: ON"
+    else
+        AntiAFKToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiAFKToggle.Text = "ANTI AFK: OFF"
+    end
+end)
+
+-- Anti Sit toggle handler
+AntiSitToggle.MouseButton1Click:Connect(function()
+    AntiSitEnabled = not AntiSitEnabled
+    if AntiSitEnabled then
+        AntiSitToggle.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+        AntiSitToggle.Text = "ANTI SIT: ON"
+    else
+        AntiSitToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiSitToggle.Text = "ANTI SIT: OFF"
+    end
+end)
+
+-- Anti Void toggle handler
+AntiVoidToggle.MouseButton1Click:Connect(function()
+    AntiVoidEnabled = not AntiVoidEnabled
+    if AntiVoidEnabled then
+        AntiVoidToggle.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+        AntiVoidToggle.Text = "ANTI VOID: ON"
+    else
+        AntiVoidToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiVoidToggle.Text = "ANTI VOID: OFF"
+    end
+end)
+
+-- Anti Gameplay Paused toggle handler
+AntiGameplayToggle.MouseButton1Click:Connect(function()
+    AntiGameplayPausedEnabled = not AntiGameplayPausedEnabled
+    if AntiGameplayPausedEnabled then
+        AntiGameplayToggle.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+        AntiGameplayToggle.Text = "ANTI PAUSED: ON"
+    else
+        AntiGameplayToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiGameplayToggle.Text = "ANTI PAUSED: OFF"
+    end
+end)
+
+-- Close popup button handler
+ClosePopupButton.MouseButton1Click:Connect(function()
+    AntiAllPopup.Visible = false
+end)
+
+-- TP To Map button handler
+TPMapButton.MouseButton1Click:Connect(function()
+    if RootPart then
+        RootPart.CFrame = CFrame.new(0, 10, 0)
+    end
+end)
+
+ShaderButton.MouseButton1Click:Connect(function()
+    setShadersEnabled(not ShaderEnabled)
+end)
+
+for _, preset in ipairs(ShaderPresetButtons) do
+    preset.button.MouseButton1Click:Connect(function()
+        setShaderTint(preset.tint)
+        if SHADER_CONFIG.AutoEnableOnTint and not ShaderEnabled then
+            setShadersEnabled(true)
+        end
+        for _, p in ipairs(ShaderPresetButtons) do
+            p.button.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        end
+        preset.button.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+    end)
+end
+
+
+-- =========================
+-- CONFIG SYSTEM (all state is declared above)
+-- =========================
+buildConfig = function()
+    return {
+        name = CurrentConfigName or "default",
+        version = 1,
+        movement = {
+            flySpeed = FlySpeed,
+            boostSpeed = BoostSpeed,
+            minSpeed = MinSpeed,
+            maxSpeed = MaxSpeed,
+            minBoostSpeed = MinBoostSpeed,
+            maxBoostSpeed = MaxBoostSpeed,
+            flyAcceleration = FlyAcceleration,
+            flySprintMultiplier = FlySprintMultiplier,
+            airWalk = AirWalk and true or false,
+            noclip = Noclip and true or false,
+            tpTool = TPToolActive and true or false,
+            flying = Flying and true or false,
+            speedBoost = SpeedBoost and true or false,
+        },
+        anti = {
+            respawnTP = RespawnTPEnabled and true or false,
+            antiAFK = AntiAFKEnabled and true or false,
+            antiSit = AntiSitEnabled and true or false,
+            antiVoid = AntiVoidEnabled and true or false,
+            antiPaused = AntiGameplayPausedEnabled and true or false,
+        },
+        shaders = {
+            enabled = ShaderEnabled and true or false,
+            tint = colorToTable(ShaderTint),
+            brightness = SHADER_CONFIG.Brightness,
+            exposure = SHADER_CONFIG.Exposure,
+            clockTime = SHADER_CONFIG.ClockTime,
+            starCount = SHADER_CONFIG.StarCount,
+            sunAngularSize = SHADER_CONFIG.SunAngularSize,
+            heartSun = SHADER_CONFIG.HeartSun and true or false,
+            sunTextureId = SHADER_CONFIG.SunTextureId,
+            bloomIntensity = SHADER_CONFIG.BloomIntensity,
+            bloomSize = SHADER_CONFIG.BloomSize,
+            bloomThreshold = SHADER_CONFIG.BloomThreshold,
+            blurSize = SHADER_CONFIG.BlurSize,
+            ccBrightness = SHADER_CONFIG.CCBrightness,
+            ccContrast = SHADER_CONFIG.CCContrast,
+            ccSaturation = SHADER_CONFIG.CCSaturation,
+            sunRaysIntensity = SHADER_CONFIG.SunRaysIntensity,
+            sunRaysSpread = SHADER_CONFIG.SunRaysSpread,
+            autoEnableOnTint = SHADER_CONFIG.AutoEnableOnTint and true or false,
+        },
+    }
+end
+
+encodeConfig = function(cfg)
+    local ok, result = pcall(function()
+        return game:GetService("HttpService"):JSONEncode(cfg)
+    end)
+    if ok and result then return result end
+    -- minimal fallback encoder for our structure
+    return nil
+end
+
+decodeConfig = function(str)
+    local ok, result = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(str)
+    end)
+    if ok then return result end
+    return nil
+end
+
+applyConfig = function(cfg)
+    if type(cfg) ~= "table" then return false, "invalid config" end
+    if cfg.name then CurrentConfigName = tostring(cfg.name) end
+
+    if type(cfg.movement) == "table" then
+        local m = cfg.movement
+        if tonumber(m.flySpeed) then FlySpeed = tonumber(m.flySpeed) end
+        if tonumber(m.boostSpeed) then BoostSpeed = tonumber(m.boostSpeed) end
+        if tonumber(m.minSpeed) then MinSpeed = tonumber(m.minSpeed) end
+        if tonumber(m.maxSpeed) then MaxSpeed = tonumber(m.maxSpeed) end
+        if tonumber(m.minBoostSpeed) then MinBoostSpeed = tonumber(m.minBoostSpeed) end
+        if tonumber(m.maxBoostSpeed) then MaxBoostSpeed = tonumber(m.maxBoostSpeed) end
+        if tonumber(m.flyAcceleration) then FlyAcceleration = tonumber(m.flyAcceleration) end
+        if tonumber(m.flySprintMultiplier) then FlySprintMultiplier = tonumber(m.flySprintMultiplier) end
+
+        -- Feature toggles (actually enable/disable, not just set flags)
+        if m.airWalk ~= nil then
+            if m.airWalk and not AirWalk then
+                pcall(EnableAirWalk)
+            elseif not m.airWalk and AirWalk then
+                pcall(DisableAirWalk)
+            end
+        end
+        if m.noclip ~= nil then
+            if m.noclip and not Noclip then
+                pcall(EnableNoclip)
+            elseif not m.noclip and Noclip then
+                pcall(DisableNoclip)
+            end
+        end
+        if m.flying ~= nil then
+            if m.flying and not Flying then
+                pcall(EnableFly)
+            elseif not m.flying and Flying then
+                pcall(DisableFly)
+            end
+        end
+        if m.speedBoost ~= nil then
+            if m.speedBoost and not SpeedBoost then
+                pcall(EnableSpeed)
+            elseif not m.speedBoost and SpeedBoost then
+                pcall(DisableSpeed)
+            end
+        end
+        if m.tpTool ~= nil then
+            if m.tpTool and not TPToolActive then
+                TPToolActive = true
+                if TPToolButton then
+                    TPToolButton.Text = "TP TOOL: ON"
+                    TPToolButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+                end
+                if not TPToolInstance or not TPToolInstance.Parent then
+                    TPToolInstance = Instance.new("Tool")
+                    TPToolInstance.Name = "TP Tool"
+                    TPToolInstance.RequiresHandle = false
+                    TPToolInstance.Parent = Player.Backpack
+                    TPToolInstance.Activated:Connect(function()
+                        if RootPart and Mouse then
+                            local targetPos = Mouse.Hit.Position
+                            if AirWalk and AirWalkPart then
+                                local newPos = Vector3.new(targetPos.X, AirWalkTargetY, targetPos.Z)
+                                RootPart.CFrame = CFrame.new(newPos)
+                                AirWalkPart.Position = Vector3.new(newPos.X, AirWalkTargetY - 3.5, newPos.Z)
+                            else
+                                RootPart.CFrame = CFrame.new(targetPos)
+                            end
+                        end
+                    end)
+                end
+            elseif not m.tpTool and TPToolActive then
+                TPToolActive = false
+                if TPToolButton then
+                    TPToolButton.Text = "TP TOOL: OFF"
+                    TPToolButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+                end
+                if TPToolInstance then
+                    TPToolInstance:Destroy()
+                    TPToolInstance = nil
+                end
+            end
+        end
+    end
+
+    if type(cfg.anti) == "table" then
+        local a = cfg.anti
+        if a.respawnTP ~= nil then RespawnTPEnabled = a.respawnTP and true or false end
+        if a.antiAFK ~= nil then AntiAFKEnabled = a.antiAFK and true or false end
+        if a.antiSit ~= nil then AntiSitEnabled = a.antiSit and true or false end
+        if a.antiVoid ~= nil then AntiVoidEnabled = a.antiVoid and true or false end
+        if a.antiPaused ~= nil then AntiGameplayPausedEnabled = a.antiPaused and true or false end
+    end
+
+    if type(cfg.shaders) == "table" then
+        local s = cfg.shaders
+        if s.tint then
+            ShaderTint = tableToColor(s.tint)
+            SHADER_CONFIG.Tint = ShaderTint
+        end
+        if s.brightness ~= nil then SHADER_CONFIG.Brightness = s.brightness end
+        if s.exposure ~= nil then SHADER_CONFIG.Exposure = s.exposure end
+        if s.clockTime ~= nil then SHADER_CONFIG.ClockTime = s.clockTime end
+        if s.starCount ~= nil then SHADER_CONFIG.StarCount = s.starCount end
+        if s.sunAngularSize ~= nil then SHADER_CONFIG.SunAngularSize = s.sunAngularSize end
+        if s.heartSun ~= nil then SHADER_CONFIG.HeartSun = s.heartSun and true or false end
+        if s.sunTextureId ~= nil then SHADER_CONFIG.SunTextureId = s.sunTextureId end
+        if s.bloomIntensity ~= nil then SHADER_CONFIG.BloomIntensity = s.bloomIntensity end
+        if s.bloomSize ~= nil then SHADER_CONFIG.BloomSize = s.bloomSize end
+        if s.bloomThreshold ~= nil then SHADER_CONFIG.BloomThreshold = s.bloomThreshold end
+        if s.blurSize ~= nil then SHADER_CONFIG.BlurSize = s.blurSize end
+        if s.ccBrightness ~= nil then SHADER_CONFIG.CCBrightness = s.ccBrightness end
+        if s.ccContrast ~= nil then SHADER_CONFIG.CCContrast = s.ccContrast end
+        if s.ccSaturation ~= nil then SHADER_CONFIG.CCSaturation = s.ccSaturation end
+        if s.sunRaysIntensity ~= nil then SHADER_CONFIG.SunRaysIntensity = s.sunRaysIntensity end
+        if s.sunRaysSpread ~= nil then SHADER_CONFIG.SunRaysSpread = s.sunRaysSpread end
+        if s.autoEnableOnTint ~= nil then SHADER_CONFIG.AutoEnableOnTint = s.autoEnableOnTint and true or false end
+        if s.enabled == true then
+            pcall(function() setShadersEnabled(true) end)
+        elseif s.enabled == false then
+            pcall(function() if ShaderEnabled then setShadersEnabled(false) end end)
+        end
+    end
+    return true
+end
+
+saveConfigToFile = function(name)
+    name = tostring(name or CurrentConfigName or "default")
+    if name == "" then name = "default" end
+    CurrentConfigName = name
+    local cfg = buildConfig()
+    cfg.name = name
+    local json = encodeConfig(cfg)
+    if not json then
+        return false, "JSON encode failed (HttpService)"
+    end
+    local file = "aether_" .. name:gsub("[^%w%-_]", "_") .. ".json"
+    local savedPath = nil
+
+    if writefile then
+        -- primary path
+        local ok = pcall(writefile, file, json)
+        if ok then savedPath = file end
+        -- folder path
+        if not savedPath then
+            if makefolder then pcall(makefolder, "AetherConfigs") end
+            ok = pcall(writefile, "AetherConfigs/" .. file, json)
+            if ok then savedPath = "AetherConfigs/" .. file end
+        end
+        -- remember which config to auto-load next execute
+        pcall(writefile, "aether_autoload.txt", name)
+    end
+
+    if savedPath then
+        return true, savedPath
+    end
+
+    if setclipboard then
+        pcall(setclipboard, json)
+        return true, "copied to clipboard (no writefile)"
+    end
+    print("[AETHER CONFIG]", json)
+    return false, "no writefile — printed JSON to console"
+end
+
+loadConfigFromFile = function(name)
+    name = tostring(name or CurrentConfigName or "default")
+    if name == "" then name = "default" end
+    local safe = name:gsub("[^%w%-_]", "_")
+    local candidates = {
+        "aether_" .. safe .. ".json",
+        "AetherConfigs/aether_" .. safe .. ".json",
+        "aether_config.json",
+        safe .. ".json",
+    }
+
+    local data, usedFile = nil, nil
+    if not readfile then
+        return false, "readfile not available on this executor"
+    end
+
+    for _, path in ipairs(candidates) do
+        local ok, content = pcall(readfile, path)
+        if ok and type(content) == "string" and content ~= "" then
+            data = content
+            usedFile = path
+            break
+        end
+    end
+
+    -- try listfiles scan as last resort
+    if not data and listfiles then
+        local ok, files = pcall(listfiles, "")
+        if ok and type(files) == "table" then
+            for _, path in ipairs(files) do
+                if type(path) == "string" and path:lower():find("aether_" .. safe:lower()) then
+                    local ok2, content = pcall(readfile, path)
+                    if ok2 and content and content ~= "" then
+                        data = content
+                        usedFile = path
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    if not data then
+        return false, "file not found: aether_" .. safe .. ".json — save a config first"
+    end
+
+    local cfg = decodeConfig(data)
+    if not cfg then return false, "JSON decode failed for " .. tostring(usedFile) end
+    local ok, err = applyConfig(cfg)
+    if not ok then return false, tostring(err) end
+    CurrentConfigName = cfg.name or name
+    return true, usedFile
+end
+
+refreshConfigUI = function()
+    pcall(function()
+        if SpeedLabel then SpeedLabel.Text = "Fly Speed: " .. tostring(math.floor(FlySpeed)) end
+        if BoostLabel then BoostLabel.Text = "Boost Speed: " .. tostring(math.floor(BoostSpeed)) end
+        if SliderFill and SliderHandle and MaxSpeed and MinSpeed then
+            local pct = math.clamp((FlySpeed - MinSpeed) / math.max(MaxSpeed - MinSpeed, 1), 0, 1)
+            SliderFill.Size = UDim2.new(pct, 0, 1, 0)
+            SliderHandle.Position = UDim2.new(pct, -8, 0, -4)
+        end
+        if BoostSliderFill and BoostSliderHandle and MaxBoostSpeed and MinBoostSpeed then
+            local pct = math.clamp((BoostSpeed - MinBoostSpeed) / math.max(MaxBoostSpeed - MinBoostSpeed, 1), 0, 1)
+            BoostSliderFill.Size = UDim2.new(pct, 0, 1, 0)
+            BoostSliderHandle.Position = UDim2.new(pct, -8, 0.5, -8)
+        end
+        if RespawnTPButton then
+            RespawnTPButton.Text = RespawnTPEnabled and "RESPAWN TP: ON" or "RESPAWN TP: OFF"
+            RespawnTPButton.BackgroundColor3 = RespawnTPEnabled and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+        if AntiAFKToggle then
+            AntiAFKToggle.Text = AntiAFKEnabled and "ANTI AFK: ON" or "ANTI AFK: OFF"
+            AntiAFKToggle.BackgroundColor3 = AntiAFKEnabled and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+        if AntiSitToggle then
+            AntiSitToggle.Text = AntiSitEnabled and "ANTI SIT: ON" or "ANTI SIT: OFF"
+            AntiSitToggle.BackgroundColor3 = AntiSitEnabled and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+        if AntiVoidToggle then
+            AntiVoidToggle.Text = AntiVoidEnabled and "ANTI VOID: ON" or "ANTI VOID: OFF"
+            AntiVoidToggle.BackgroundColor3 = AntiVoidEnabled and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+        if AntiGameplayToggle then
+            AntiGameplayToggle.Text = AntiGameplayPausedEnabled and "ANTI PAUSED: ON" or "ANTI PAUSED: OFF"
+            AntiGameplayToggle.BackgroundColor3 = AntiGameplayPausedEnabled and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+        if ConfigNameBox then ConfigNameBox.Text = CurrentConfigName end
+        if ShaderButton then
+            ShaderButton.Text = ShaderEnabled and "SHADERS: ON" or "SHADERS: OFF"
+            ShaderButton.BackgroundColor3 = ShaderEnabled and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+        if AirWalkButton then
+            AirWalkButton.Text = AirWalk and "AIR WALK: ON" or "AIR WALK: OFF"
+            AirWalkButton.BackgroundColor3 = AirWalk and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+        if NoclipButton then
+            NoclipButton.Text = Noclip and "NOCLIP: ON" or "NOCLIP: OFF"
+            NoclipButton.BackgroundColor3 = Noclip and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+        if TPToolButton then
+            TPToolButton.Text = TPToolActive and "TP TOOL: ON" or "TP TOOL: OFF"
+            TPToolButton.BackgroundColor3 = TPToolActive and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+        if FlyButton then
+            FlyButton.Text = Flying and "FLY: ON" or "FLY: OFF"
+            FlyButton.BackgroundColor3 = Flying and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+        if SpeedButton then
+            SpeedButton.Text = SpeedBoost and "SPEED: ON" or "SPEED: OFF"
+            SpeedButton.BackgroundColor3 = SpeedBoost and Color3.fromRGB(150, 60, 220) or Color3.fromRGB(32, 36, 55)
+        end
+    end)
+end
+
+SaveConfigButton.MouseButton1Click:Connect(function()
+    local name = ConfigNameBox and ConfigNameBox.Text or "default"
+    if name == "" then name = "default" end
+    local ok, msg = saveConfigToFile(name)
+    if ConfigStatusLabel then
+        ConfigStatusLabel.Text = ok and ("Saved: " .. tostring(msg)) or ("Save failed: " .. tostring(msg))
+        ConfigStatusLabel.TextColor3 = ok and Color3.fromRGB(100, 255, 140) or Color3.fromRGB(255, 100, 100)
+    end
+    print("[AETHER] Save config:", ok, msg)
+end)
+
+LoadConfigButton.MouseButton1Click:Connect(function()
+    local name = ConfigNameBox and ConfigNameBox.Text or "default"
+    if name == "" then name = "default" end
+    local ok, msg = loadConfigFromFile(name)
+    if ok then
+        refreshConfigUI()
+    end
+    if ConfigStatusLabel then
+        ConfigStatusLabel.Text = ok and ("Loaded: " .. tostring(msg)) or ("Load failed: " .. tostring(msg))
+        ConfigStatusLabel.TextColor3 = ok and Color3.fromRGB(100, 255, 140) or Color3.fromRGB(255, 100, 100)
+    end
+    print("[AETHER] Load config:", ok, msg)
+end)
+
+-- Auto-load config on execute
+task.spawn(function()
+    -- Wait for character so Air Walk / Noclip / TP Tool can enable cleanly
+    local char = Player.Character
+    if not char then
+        char = Player.CharacterAdded:Wait()
+    end
+    if char then
+        char:WaitForChild("HumanoidRootPart", 5)
+        char:WaitForChild("Humanoid", 5)
+    end
+    task.wait(AUTO_LOAD_DELAY or 0.5)
+
+    -- Resolve which config to load:
+    -- 1) aether_autoload.txt (written when you SAVE)
+    -- 2) AUTO_LOAD_CONFIG at top of script
+    local name = nil
+    if readfile then
+        local ok, content = pcall(readfile, "aether_autoload.txt")
+        if ok and type(content) == "string" then
+            content = content:gsub("%s+", "")
+            if content ~= "" then name = content end
+        end
+    end
+    if not name or name == "" then
+        name = AUTO_LOAD_CONFIG
+    end
+    if not name or name == "" then
+        print("[AETHER] Auto-load disabled (no name set)")
+        return
+    end
+
+    print("[AETHER] Auto-loading config:", name)
+
+    local ok, msg
+    for attempt = 1, 3 do
+        ok, msg = loadConfigFromFile(name)
+        if ok then break end
+        task.wait(0.4)
+    end
+
+    if ok then
+        refreshConfigUI()
+        if ConfigNameBox then ConfigNameBox.Text = name end
+        if ConfigStatusLabel then
+            ConfigStatusLabel.Text = "Auto-loaded: " .. tostring(msg)
+            ConfigStatusLabel.TextColor3 = Color3.fromRGB(100, 255, 140)
+        end
+        print("[AETHER] Auto-loaded OK:", name, msg)
+    else
+        if ConfigStatusLabel then
+            ConfigStatusLabel.Text = "Auto-load failed: " .. tostring(msg)
+            ConfigStatusLabel.TextColor3 = Color3.fromRGB(255, 180, 80)
+        end
+        print("[AETHER] Auto-load FAILED:", name, msg)
+        print("[AETHER] Tip: open Misc, turn features on, SAVE CONFIG as '" .. tostring(name) .. "' first")
+    end
+end)
+
+
+-- Anti AFK
+RunService.Heartbeat:Connect(function()
+    if AntiAFKEnabled then
+        -- Simulate activity
+        local VirtualInput = game:GetService("VirtualInputManager")
+        VirtualInput:SendKeyEvent(false, Enum.KeyCode.W)
+        task.wait()
+        VirtualInput:SendKeyEvent(true, Enum.KeyCode.W)
+    end
+end)
+
+-- Anti Sit (initial character)
+if Character and Humanoid then
+    Humanoid.Seated:Connect(function()
+        if AntiSitEnabled then
+            Humanoid.PlatformStand = true
+            task.wait(0.1)
+            Humanoid.PlatformStand = false
+            Humanoid:Jump()
+        end
+    end)
+end
+
+-- Anti Void
+RunService.RenderStepped:Connect(function()
+    if AntiVoidEnabled and RootPart then
+        if RootPart.Position.Y < -100 then
+            RootPart.CFrame = CFrame.new(RootPart.Position.X, 10, RootPart.Position.Z)
+            RootPart.Velocity = Vector3.new(0, 100, 0)
+        end
+    end
+end)
+
+-- Anti Gameplay Paused
+local function simulateActivity()
+    local VirtualInput = game:GetService("VirtualInputManager")
+    pcall(function()
+        VirtualInput:SendKeyEvent(true, Enum.KeyCode.W)
+        task.wait()
+        VirtualInput:SendKeyEvent(false, Enum.KeyCode.W)
+    end)
+    pcall(function()
+        VirtualInput:SendMouseButtonEvent(Enum.UserInputType.MouseButton1, true)
+        task.wait()
+        VirtualInput:SendMouseButtonEvent(Enum.UserInputType.MouseButton1, false)
+    end)
+    pcall(function()
+        VirtualInput:SendMouseMoveEvent(1, 1)
+    end)
+end
+
+game:GetService("Players").LocalPlayer.Idled:Connect(function(time)
+    if AntiGameplayPausedEnabled then
+        simulateActivity()
+    end
+end)
+
+-- Continuous activity simulation
+task.spawn(function()
+    while true do
+        if AntiGameplayPausedEnabled then
+            simulateActivity()
+        end
+        task.wait(10)
+    end
+end)
+
+-- TP Tool now uses tool in inventory, no mouse handler needed
+
+-- Slider logic
+local SliderDragging = false
+local SliderActive = false
+
+-- Boost Slider logic
+local BoostSliderDragging = false
+local BoostSliderActive = false
+
+local function UpdateSlider(value)
+    local clampedValue = math.clamp(value, MinSpeed, MaxSpeed)
+    local percent = (clampedValue - MinSpeed) / (MaxSpeed - MinSpeed)
+    
+    FlySpeed = clampedValue
+    SpeedLabel.Text = "Fly Speed: " .. math.floor(FlySpeed)
+    SliderFill.Size = UDim2.new(percent, 0, 1, 0)
+    SliderHandle.Position = UDim2.new(percent, -8, 0, -4)
+end
+
+local function GetSpeedFromMouse()
+    local mousePos = UserInputService:GetMouseLocation().X
+    local trackPos = SliderTrack.AbsolutePosition.X
+    local trackSize = SliderTrack.AbsoluteSize.X
+    local percent = (mousePos - trackPos) / trackSize
+    local speedValue = MinSpeed + (percent * (MaxSpeed - MinSpeed))
+    UpdateSlider(speedValue)
+end
+
+SliderHandle.MouseButton1Down:Connect(function()
+    SliderDragging = true
+    SliderActive = true
+end)
+
+SliderTrack.MouseButton1Down:Connect(function()
+    SliderDragging = true
+    SliderActive = true
+    GetSpeedFromMouse()
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        SliderDragging = false
+        SliderActive = false
+        BoostSliderDragging = false
+        BoostSliderActive = false
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if SliderDragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        GetSpeedFromMouse()
+    end
+end)
+
+-- Initialize slider at current speed
+UpdateSlider(FlySpeed)
+
+-- Boost slider functions
+local function UpdateBoostSlider(value)
+    local clampedValue = math.clamp(value, MinBoostSpeed, MaxBoostSpeed)
+    local percent = (clampedValue - MinBoostSpeed) / (MaxBoostSpeed - MinBoostSpeed)
+    
+    BoostSpeed = clampedValue
+    BoostLabel.Text = "Boost Speed: " .. math.floor(BoostSpeed)
+    BoostSliderFill.Size = UDim2.new(percent, 0, 1, 0)
+    BoostSliderHandle.Position = UDim2.new(percent, -9, 0, -4)
+    
+    -- Update walkspeed if speed boost is active
+    if SpeedBoost then
+        Humanoid.WalkSpeed = BoostSpeed
+    end
+end
+
+local function GetBoostSpeedFromMouse()
+    local mousePos = UserInputService:GetMouseLocation().X
+    local trackPos = BoostSliderTrack.AbsolutePosition.X
+    local trackSize = BoostSliderTrack.AbsoluteSize.X
+    local percent = (mousePos - trackPos) / trackSize
+    local speedValue = MinBoostSpeed + (percent * (MaxBoostSpeed - MinBoostSpeed))
+    UpdateBoostSlider(speedValue)
+end
+
+BoostSliderHandle.MouseButton1Down:Connect(function()
+    BoostSliderDragging = true
+    BoostSliderActive = true
+end)
+
+BoostSliderTrack.MouseButton1Down:Connect(function()
+    BoostSliderDragging = true
+    BoostSliderActive = true
+    GetBoostSpeedFromMouse()
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if BoostSliderDragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        GetBoostSpeedFromMouse()
+    end
+end)
+
+-- Initialize boost slider at current boost speed
+UpdateBoostSlider(BoostSpeed)
+
+-- Tab switching logic
+local function SwitchTab(tabName)
+    local activeBg = Color3.fromRGB(140, 60, 200)
+    local inactiveBg = Color3.fromRGB(28, 30, 48)
+    local activeText = Color3.fromRGB(255, 255, 255)
+    local inactiveText = Color3.fromRGB(160, 170, 200)
+
+    local function style(tab, on)
+        tab.BackgroundColor3 = on and activeBg or inactiveBg
+        tab.TextColor3 = on and activeText or inactiveText
+        tab.Font = on and Enum.Font.GothamBold or Enum.Font.GothamSemibold
+    end
+
+    MovementContent.Visible = (tabName == "Movement")
+    TargetContent.Visible = (tabName == "Target")
+    SettingsContent.Visible = (tabName == "Misc")
+    SettingsTabContent.Visible = (tabName == "Settings")
+
+    style(Tab1, tabName == "Movement")
+    style(Tab2, tabName == "Target")
+    style(Tab3, tabName == "Misc")
+    style(Tab4, tabName == "Settings")
+
+    if tabName == "Target" then
+        UpdatePlayerList()
+    end
+end
+
+Tab1.MouseButton1Click:Connect(function()
+    SwitchTab("Movement")
+end)
+
+Tab2.MouseButton1Click:Connect(function()
+    SwitchTab("Target")
+end)
+
+Tab3.MouseButton1Click:Connect(function()
+    SwitchTab("Misc")
+end)
+
+Tab4.MouseButton1Click:Connect(function()
+    SwitchTab("Settings")
+end)
+
+-- Player list update function
+local function UpdatePlayerList()
+    -- Clear existing buttons
+    for _, child in ipairs(PlayerListFrame:GetChildren()) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+    
+    -- Add buttons for each player
+    for _, targetPlayer in ipairs(Players:GetPlayers()) do
+        if targetPlayer ~= Player then
+            local PlayerButton = Instance.new("TextButton")
+            PlayerButton.Name = targetPlayer.Name
+            PlayerButton.Size = UDim2.new(1, 0, 0, 38)
+            PlayerButton.BackgroundColor3 = Color3.fromRGB(36, 40, 62)
+            PlayerButton.BorderSizePixel = 0
+            PlayerButton.Text = ""
+            PlayerButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+            PlayerButton.TextSize = 14
+            PlayerButton.Font = Enum.Font.GothamSemibold
+            PlayerButton.TextXAlignment = Enum.TextXAlignment.Left
+            PlayerButton.Parent = PlayerListFrame
+            
+            addCorner(PlayerButton, 8)
+            
+            -- Centered name label (vertically + clear of avatar)
+            local NameLabel = Instance.new("TextLabel")
+            NameLabel.Name = "NameLabel"
+            NameLabel.Size = UDim2.new(1, -44, 1, 0)
+            NameLabel.Position = UDim2.new(0, 40, 0, 0)
+            NameLabel.BackgroundTransparency = 1
+            NameLabel.Text = targetPlayer.Name
+            NameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+            NameLabel.TextSize = 14
+            NameLabel.Font = Enum.Font.GothamSemibold
+            NameLabel.TextXAlignment = Enum.TextXAlignment.Left
+            NameLabel.TextYAlignment = Enum.TextYAlignment.Center
+            NameLabel.Parent = PlayerButton
+            
+            -- Tiny avatar headshot
+            local Avatar = Instance.new("ImageLabel")
+            Avatar.Name = "Avatar"
+            Avatar.Size = UDim2.new(0, 28, 0, 28)
+            Avatar.Position = UDim2.new(0, -1, 0.5, -14)
+            Avatar.BackgroundColor3 = Color3.fromRGB(24, 26, 42)
+            Avatar.BorderSizePixel = 0
+            Avatar.Image = "rbxthumb://type=AvatarHeadShot&id=" .. targetPlayer.UserId .. "&w=48&h=48"
+            Avatar.Parent = PlayerButton
+            
+            local AvatarCorner = Instance.new("UICorner")
+            AvatarCorner.CornerRadius = UDim.new(1, 0) -- circle
+            AvatarCorner.Parent = Avatar
+            
+            addStroke(Avatar, Color3.fromRGB(160, 80, 220), 1, 0.4)
+            
+            -- Highlight if selected
+            if SelectedPlayer == targetPlayer then
+                PlayerButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+            end
+            
+            PlayerButton.MouseButton1Click:Connect(function()
+                -- Select player
+                SelectedPlayer = targetPlayer
+                SelectedLabel.Text = "Selected: " .. targetPlayer.Name
+                PlayerNameInput.Text = targetPlayer.Name
+                SelectedAvatar.Image = "rbxthumb://type=AvatarHeadShot&id=" .. targetPlayer.UserId .. "&w=48&h=48"
+                
+                -- Turn off spectate if switching players
+                if SpectateActive then
+                    SpectateActive = false
+                    ViewButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+                    ViewButton.Text = "VIEW"
+                    if OriginalCameraSubject then
+                        workspace.CurrentCamera.CameraSubject = OriginalCameraSubject
+                        OriginalCameraSubject = nil
+                    else
+                        workspace.CurrentCamera.CameraSubject = Player.Character.Humanoid
+                    end
+                end
+                
+                UpdatePlayerList() -- Refresh to update highlighting
+            end)
+        end
+    end
+    
+    -- Update canvas size to fit all buttons
+    PlayerListFrame.CanvasSize = UDim2.new(0, 0, 0, PlayerListLayout.AbsoluteContentSize.Y)
+end
+
+-- Update player list when new players join
+Players.PlayerAdded:Connect(UpdatePlayerList)
+Players.PlayerRemoving:Connect(function(player)
+    if SelectedPlayer == player then
+        SelectedPlayer = nil
+        AttachmentMode = nil
+        SelectedLabel.Text = "Selected: None"
+        PlayerNameInput.Text = ""
+        SelectedAvatar.Image = ""
+        AttachmentLoop = false
+        if AttachmentVelocity then
+            AttachmentVelocity:Destroy()
+            AttachmentVelocity = nil
+        end
+        Humanoid.Sit = false
+        if OriginalWalkSpeed then
+            Humanoid.WalkSpeed = OriginalWalkSpeed
+        end
+        
+        -- Turn off anti all if target leaves
+        if AntiAllEnabled then
+            AntiAllEnabled = false
+            AntiAFKEnabled = false
+            AntiSitEnabled = false
+            AntiVoidEnabled = false
+            AntiGameplayPausedEnabled = false
+            AntiAllButton.Text = "ANTI ALL"
+            AntiAllButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+            AntiAllPopup.Visible = false
+            AntiAFKToggle.Text = "ANTI AFK: OFF"
+            AntiAFKToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+            AntiSitToggle.Text = "ANTI SIT: OFF"
+            AntiSitToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+            AntiVoidToggle.Text = "ANTI VOID: OFF"
+            AntiVoidToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+            AntiGameplayToggle.Text = "ANTI PAUSED: OFF"
+            AntiGameplayToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        end
+        
+        -- Turn off spectate if target leaves
+        if SpectateActive then
+            SpectateActive = false
+            ViewButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+            ViewButton.Text = "VIEW"
+            if OriginalCameraSubject then
+                workspace.CurrentCamera.CameraSubject = OriginalCameraSubject
+                OriginalCameraSubject = nil
+            else
+                workspace.CurrentCamera.CameraSubject = Player.Character.Humanoid
+            end
+        end
+        HeadsitButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        BackpackButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        StandButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        DoggyButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        DragButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        FlingButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        FlingButton.Text = "FLING"
+        FlingActive = false
+        VCButton.Text = "VC BYPASS"
+        VCButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiAllButton.Text = "ANTI ALL"
+        AntiAllButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiAllPopup.Visible = false
+        AntiAFKToggle.Text = "ANTI AFK: OFF"
+        AntiAFKToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiSitToggle.Text = "ANTI SIT: OFF"
+        AntiSitToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiVoidToggle.Text = "ANTI VOID: OFF"
+        AntiVoidToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiGameplayToggle.Text = "ANTI PAUSED: OFF"
+        AntiGameplayToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiAllEnabled = false
+        AntiAFKEnabled = false
+        AntiSitEnabled = false
+        AntiVoidEnabled = false
+        AntiGameplayPausedEnabled = false
+        Humanoid.PlatformStand = false
+    end
+    UpdatePlayerList()
+end)
+
+-- Initial population
+UpdatePlayerList()
+
+-- Headsit button handler
+-- Shared stop attachment
+local function StopAttachment()
+    AttachmentMode = nil
+    AttachmentLoop = false
+    if AttachmentVelocity then
+        AttachmentVelocity:Destroy()
+        AttachmentVelocity = nil
+    end
+    if Humanoid then
+        Humanoid.Sit = false
+        Humanoid.PlatformStand = false
+        pcall(function() Humanoid:ChangeState(Enum.HumanoidStateType.Freefall) end)
+        Humanoid.WalkSpeed = OriginalWalkSpeed or NormalSpeed
+    end
+    -- reset all attach button colors
+    for _, b in ipairs({HeadsitButton, BackpackButton, StandButton, DoggyButton, DragButton}) do
+        b.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+    end
+end
+
+local function StartAttachment(mode, button, offsetFunc)
+    if not SelectedPlayer or not SelectedPlayer.Character or not RootPart then return end
+    if AttachmentMode == mode then
+        StopAttachment()
+        return
+    end
+    StopAttachment()
+    AttachmentMode = mode
+    button.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+    OriginalWalkSpeed = Humanoid.WalkSpeed
+    Humanoid.WalkSpeed = 0
+    if not AttachmentVelocity then
+        AttachmentVelocity = Instance.new("BodyAngularVelocity")
+        AttachmentVelocity.Name = "AttachmentVelocity"
+        AttachmentVelocity.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+        AttachmentVelocity.AngularVelocity = Vector3.new(0, 0, 0)
+        AttachmentVelocity.Parent = RootPart
+    end
+    AttachmentLoop = true
+    task.spawn(function()
+        while AttachmentLoop and SelectedPlayer and SelectedPlayer.Character and AttachmentMode == mode do
+            pcall(function()
+                local cf = offsetFunc(SelectedPlayer.Character)
+                if cf then
+                    RootPart.CFrame = cf
+                    RootPart.Velocity = Vector3.new(0, 0, 0)
+                end
+            end)
+            task.wait()
+        end
+    end)
+end
+
+HeadsitButton.MouseButton1Click:Connect(function()
+    StartAttachment("headsit", HeadsitButton, function(char)
+        local head = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+        if head then
+            Humanoid.Sit = true
+            return head.CFrame * CFrame.new(0, 2, 0)
+        end
+    end)
+end)
+
+BackpackButton.MouseButton1Click:Connect(function()
+    StartAttachment("backpack", BackpackButton, function(char)
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if root then
+            Humanoid.Sit = true
+            return root.CFrame * CFrame.new(0, 0, 1.2) * CFrame.Angles(0, -3, 0)
+        end
+    end)
+end)
+
+StandButton.MouseButton1Click:Connect(function()
+    StartAttachment("stand", StandButton, function(char)
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if root then
+            return root.CFrame * CFrame.new(-3, 1, 0)
+        end
+    end)
+end)
+
+DoggyButton.MouseButton1Click:Connect(function()
+    StartAttachment("doggy", DoggyButton, function(char)
+        local part = char:FindFirstChild("LowerTorso") or char:FindFirstChild("Torso") or char:FindFirstChild("HumanoidRootPart")
+        if part then
+            return part.CFrame * CFrame.new(0, 0.23, 0)
+        end
+    end)
+end)
+
+DragButton.MouseButton1Click:Connect(function()
+    StartAttachment("drag", DragButton, function(char)
+        local hand = char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm") or char:FindFirstChild("HumanoidRootPart")
+        if hand then
+            return hand.CFrame * CFrame.new(0, -2.5, 1) * CFrame.Angles(-2, -3, 0)
+        end
+    end)
+end)
+
+TeleportButton.MouseButton1Click:Connect(function()
+    if SelectedPlayer and SelectedPlayer.Character and RootPart then
+        local targetRoot = SelectedPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if targetRoot then
+            -- Safe-ish TP: lock velocity briefly
+            task.spawn(function()
+                for i = 1, 20 do
+                    RootPart.Velocity = Vector3.new(0, 0, 0)
+                    RootPart.CFrame = targetRoot.CFrame * CFrame.new(0, 2, 0)
+                    task.wait()
+                end
+                -- Keep air walk height if active
+                if AirWalk and AirWalkPart then
+                    AirWalkTargetY = RootPart.Position.Y
+                    AirWalkPart.Position = Vector3.new(RootPart.Position.X, AirWalkTargetY - 3.5, RootPart.Position.Z)
+                end
+            end)
+        end
+    end
+end)
+
+-- View button handler
+ViewButton.MouseButton1Click:Connect(function()
+    if SpectateActive then
+        SpectateActive = false
+        ViewButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        ViewButton.Text = "VIEW"
+        if OriginalCameraSubject then
+            workspace.CurrentCamera.CameraSubject = OriginalCameraSubject
+            OriginalCameraSubject = nil
+        else
+            workspace.CurrentCamera.CameraSubject = Player.Character.Humanoid
+        end
+    else
+        if SelectedPlayer and SelectedPlayer.Character then
+            local targetRoot = SelectedPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if targetRoot then
+                SpectateActive = true
+                ViewButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+                ViewButton.Text = "VIEW: ON"
+                OriginalCameraSubject = workspace.CurrentCamera.CameraSubject
+                workspace.CurrentCamera.CameraSubject = targetRoot
+            end
+        end
+    end
+end)
+
+-- Fling (basic BodyVelocity fling toward target)
+FlingButton.MouseButton1Click:Connect(function()
+    if not SelectedPlayer or not SelectedPlayer.Character or not RootPart then return end
+    if FlingActive then
+        FlingActive = false
+        FlingButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        FlingButton.Text = "FLING"
+        return
+    end
+    FlingActive = true
+    FlingButton.BackgroundColor3 = Color3.fromRGB(150, 60, 220)
+    FlingButton.Text = "FLING: ON"
+    local savedPos = RootPart.CFrame
+    task.spawn(function()
+        local bv = Instance.new("BodyVelocity")
+        bv.Name = "FlingBV"
+        bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+        bv.Velocity = Vector3.new(0, 0, 0)
+        bv.Parent = RootPart
+        while FlingActive and SelectedPlayer and SelectedPlayer.Character and RootPart do
+            pcall(function()
+                local tr = SelectedPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if tr then
+                    RootPart.CFrame = tr.CFrame
+                    bv.Velocity = Vector3.new(9999, 9999, 9999)
+                end
+            end)
+            task.wait()
+        end
+        if bv then bv:Destroy() end
+        if RootPart then
+            RootPart.Velocity = Vector3.new(0, 0, 0)
+            RootPart.CFrame = savedPos
+        end
+        FlingActive = false
+        FlingButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        FlingButton.Text = "FLING"
+    end)
+end)
+
+-- Player name input handler
+PlayerNameInput.FocusLost:Connect(function(enterPressed)
+    if enterPressed then
+        local name = PlayerNameInput.Text
+        if name ~= "" then
+            -- Find closest matching player
+            local closestPlayer = nil
+            local closestMatch = 0
+            
+            for _, targetPlayer in pairs(Players:GetPlayers()) do
+                local targetName = targetPlayer.Name:lower()
+                local targetDisplay = targetPlayer.DisplayName:lower()
+                local inputName = name:lower()
+                
+                -- Check for partial match
+                if targetName:find(inputName, 1, true) or targetDisplay:find(inputName, 1, true) then
+                    -- Calculate match length (longer match = closer)
+                    local matchLength = math.max(
+                        targetName:find(inputName, 1, true) and #inputName or 0,
+                        targetDisplay:find(inputName, 1, true) and #inputName or 0
+                    )
+                    
+                    if matchLength > closestMatch then
+                        closestMatch = matchLength
+                        closestPlayer = targetPlayer
+                    end
+                end
+            end
+            
+            if closestPlayer then
+                SelectedPlayer = closestPlayer
+                SelectedLabel.Text = "Selected: " .. closestPlayer.Name
+                PlayerNameInput.Text = closestPlayer.Name
+                SelectedAvatar.Image = "rbxthumb://type=AvatarHeadShot&id=" .. closestPlayer.UserId .. "&w=48&h=48"
+                UpdatePlayerList()
+            else
+                SelectedLabel.Text = "Selected: Not Found"
+                SelectedAvatar.Image = ""
+            end
+        end
+    end
+end)
+
+-- Initial population
+UpdatePlayerList()
+
+-- UI Dragging logic (drag from the AETHER title bar only)
+local UIdragging = false
+local dragStartMouse = Vector2.new()
+local dragStartFrame = UDim2.new()
+local MenuVisible = true
+
+-- Toggle menu keybind (default B) + capture new key
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    if MenuKeyCapturing then
+        MenuKeyCapturing = false
+        if input.KeyCode ~= Enum.KeyCode.Unknown then
+            MenuToggleKey = input.KeyCode
+            if MenuKeyButton then
+                MenuKeyButton.Text = "TOGGLE MENU: " .. input.KeyCode.Name
+                MenuKeyButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+            end
+            print("[AETHER] Menu key set to:", input.KeyCode.Name)
+        end
+        return
+    end
+
+    if gameProcessed then return end
+    if input.KeyCode == MenuToggleKey then
+        MenuVisible = not MenuVisible
+        MainFrame.Visible = MenuVisible
+    end
+end)
+
+Title.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        if SliderActive or BoostSliderActive or ColorWheelActive then return end
+        UIdragging = true
+        dragStartMouse = Vector2.new(input.Position.X, input.Position.Y)
+        dragStartFrame = MainFrame.Position
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        UIdragging = false
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if not UIdragging then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if SliderActive or BoostSliderActive or ColorWheelActive then return end
+    local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStartMouse
+    MainFrame.Position = UDim2.new(
+        dragStartFrame.X.Scale, dragStartFrame.X.Offset + delta.X,
+        dragStartFrame.Y.Scale, dragStartFrame.Y.Offset + delta.Y
+    )
+end)
+
+-- Fly controls
+local function UpdateFly(deltaTime)
+    if Flying and BodyVelocity and BodyGyro and Camera then
+        local moveDirection = Vector3.new()
+        local targetSpeed = FlySpeed
+        
+        -- Force humanoid state to Freefall to prevent walk/jump animations
+        if Humanoid:GetState() ~= Enum.HumanoidStateType.Freefall then
+            Humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+        end
+        
+        -- Sprint with Shift
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+            targetSpeed = FlySpeed * FlySprintMultiplier
+        end
+        
+        local camCF = Camera.CFrame
+        local camLook = camCF.LookVector
+        local camRight = camCF.RightVector
+        
+        -- Don't flatten - fly in full camera direction
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+            moveDirection = moveDirection + camLook
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+            moveDirection = moveDirection - camLook
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+            moveDirection = moveDirection - camRight
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+            moveDirection = moveDirection + camRight
+        end
+        
+        if moveDirection.Magnitude > 0 then
+            moveDirection = moveDirection.Unit * targetSpeed
+        end
+        
+        -- Smooth acceleration
+        local lerpFactor = math.clamp(FlyAcceleration * deltaTime, 0, 1)
+        CurrentVelocity = CurrentVelocity:Lerp(moveDirection, lerpFactor)
+        
+        BodyVelocity.Velocity = CurrentVelocity
+        BodyGyro.CFrame = camCF
+    end
+end
+
+-- RenderStepped for smooth fly and air walk
+RunService.RenderStepped:Connect(function(deltaTime)
+    if ScriptActive then
+        UpdateFly(deltaTime)
+        
+        if Noclip and Character then
+            for _, part in pairs(Character:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = false
+                end
+            end
+        end
+        
+        -- Update air walk platform position
+        if AirWalk and AirWalkPart and RootPart then
+            -- Allow height adjustment with E/Q while air walking (slower now)
+            if UserInputService:IsKeyDown(Enum.KeyCode.E) then
+                AirWalkTargetY = AirWalkTargetY + 0.1
+            elseif UserInputService:IsKeyDown(Enum.KeyCode.Q) then
+                AirWalkTargetY = AirWalkTargetY - 0.1
+            end
+            
+            -- Raycast down to find ground
+            local rayOrigin = RootPart.Position
+            local rayDirection = Vector3.new(0, -100, 0)
+            local raycastParams = RaycastParams.new()
+            raycastParams.FilterDescendantsInstances = {Character, AirWalkPart}
+            raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+            
+            local rayResult = Workspace:Raycast(rayOrigin, rayDirection, raycastParams)
+            
+            -- Clamp target Y to be above ground
+            if rayResult then
+                local groundY = rayResult.Position.Y
+                local minHeight = groundY + 3 -- Keep at least 3 studs above ground (character height buffer)
+                if AirWalkTargetY < minHeight then
+                    AirWalkTargetY = minHeight
+                end
+            end
+            
+            -- Move platform to stay under character
+            AirWalkPart.Position = Vector3.new(RootPart.Position.X, AirWalkTargetY - 3.5, RootPart.Position.Z)
+        end
+        
+        -- Headsit/Backpack attachment
+        -- Seat is welded to target, no manual updates needed
+    end
+end)
+
+-- Handle character respawn
+Player.CharacterAdded:Connect(function(newCharacter)
+    Character = newCharacter
+    Humanoid = Character:WaitForChild("Humanoid")
+    RootPart = Character:WaitForChild("HumanoidRootPart")
+    NormalSpeed = Humanoid.WalkSpeed
+    
+    -- Connect died event to save position
+    Humanoid.Died:Connect(function()
+        if RespawnTPEnabled and RootPart then
+            SavedPosition = RootPart.CFrame
+        end
+    end)
+    
+    -- Connect anti sit on respawn
+    Humanoid.Seated:Connect(function()
+        if AntiSitEnabled then
+            Humanoid.PlatformStand = true
+            task.wait(0.1)
+            Humanoid.PlatformStand = false
+            Humanoid:Jump()
+        end
+    end)
+    
+    -- Teleport back to saved position if enabled
+    if RespawnTPEnabled and SavedPosition then
+        task.wait(0.5) -- Wait for character to fully load
+        RootPart.CFrame = SavedPosition
+    end
+    
+    if Flying then
+        DisableFly()
+    end
+    if SpeedBoost then
+        DisableSpeed()
+    end
+    if AirWalk then
+        DisableAirWalk()
+    end
+    if Noclip then
+        DisableNoclip()
+    end
+    if TPToolActive then
+        TPToolActive = false
+        TPToolButton.Text = "TP TOOL: OFF"
+        TPToolButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        if TPToolInstance then
+            TPToolInstance:Destroy()
+            TPToolInstance = nil
+        end
+    end
+    if AttachmentMode then
+        AttachmentMode = nil
+        AttachmentLoop = false
+        if AttachmentVelocity then
+            AttachmentVelocity:Destroy()
+            AttachmentVelocity = nil
+        end
+        Humanoid.Sit = false
+        if OriginalWalkSpeed then
+            Humanoid.WalkSpeed = OriginalWalkSpeed
+        end
+        HeadsitButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        BackpackButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        StandButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        DoggyButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        DragButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        FlingButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        FlingButton.Text = "FLING"
+        FlingActive = false
+        VCButton.Text = "VC BYPASS"
+        VCButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiAllButton.Text = "ANTI ALL"
+        AntiAllButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiAllPopup.Visible = false
+        AntiAFKToggle.Text = "ANTI AFK: OFF"
+        AntiAFKToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiSitToggle.Text = "ANTI SIT: OFF"
+        AntiSitToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiVoidToggle.Text = "ANTI VOID: OFF"
+        AntiVoidToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiGameplayToggle.Text = "ANTI PAUSED: OFF"
+        AntiGameplayToggle.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        AntiAllEnabled = false
+        AntiAFKEnabled = false
+        AntiSitEnabled = false
+        AntiVoidEnabled = false
+        AntiGameplayPausedEnabled = false
+    end
+    
+    -- Turn off spectate on respawn
+    if SpectateActive then
+        SpectateActive = false
+        ViewButton.BackgroundColor3 = Color3.fromRGB(32, 36, 55)
+        ViewButton.Text = "VIEW"
+        if OriginalCameraSubject then
+            workspace.CurrentCamera.CameraSubject = OriginalCameraSubject
+            OriginalCameraSubject = nil
+        else
+            workspace.CurrentCamera.CameraSubject = Player.Character.Humanoid
+        end
+    end
+end)
+
+-- Connect died event for initial character (if it exists when script loads)
+if Character and Humanoid then
+    Humanoid.Died:Connect(function()
+        if RespawnTPEnabled and RootPart then
+            SavedPosition = RootPart.CFrame
+        end
+    end)
+end
+
+-- Notification
+pcall(function()
+    StarterGui:SetCore("ChatMakeSystemMessage", {
+        Text = "[AETHER] Loaded! Press buttons in UI to toggle.";
+        Color = Color3.fromRGB(0, 255, 0);
+        Font = Enum.Font.GothamBold;
+    })
+end)
+print("[AETHER] Loaded successfully")
