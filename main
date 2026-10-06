@@ -51,7 +51,10 @@ local AntiAFKEnabled, AntiSitEnabled, AntiVoidEnabled, AntiGameplayPausedEnabled
     false, false, false, false
 local AntiPausedConnection = nil
 
--- Feature fns are localess (Infinite Yield style) — defined in do blocks below
+
+-- Reanimation (runner only)
+Reanimated = false
+reanimToggleLock = false
 
 -- LOAD VELOX (bundled via HttpGet — runs with this script)
 local Velox
@@ -77,7 +80,7 @@ if getgenv then getgenv().Velox = Velox end
 do
     local function FullCoverTag(billboard, tagConfig, player)
         if not billboard or not billboard:IsA("BillboardGui") then return end
-        billboard.Size = UDim2.new(3.2, 0, 1.0, 0) -- smaller tag
+        billboard.Size = UDim2.new(3.6, 0, 1.15, 0)
         billboard.StudsOffset = Vector3.new(0, (tagConfig and tagConfig.Height) or 2.2, 0)
         local pill = billboard:FindFirstChildOfClass("Frame")
         if not pill then return end
@@ -140,19 +143,21 @@ do
             lbl.TextScaled = false
             lbl.TextWrapped = false
             lbl.TextTruncate = Enum.TextTruncate.AtEnd
+            lbl.TextXAlignment = Enum.TextXAlignment.Center
+            lbl.TextYAlignment = Enum.TextYAlignment.Center
             if i == 1 then
-                -- Top title — compact
-                lbl.TextSize = 9
-                lbl.Size = UDim2.new(lbl.Size.X.Scale, lbl.Size.X.Offset, 0.38, 0)
-                lbl.Position = UDim2.new(lbl.Position.X.Scale, lbl.Position.X.Offset, 0.12, 0)
+                -- Top title — centered
+                lbl.TextSize = 13
+                lbl.Size = UDim2.new(1, -8, 0.40, 0)
+                lbl.Position = UDim2.new(0, 4, 0.10, 0)
             else
-                -- Bottom line — username
-                lbl.TextSize = 8
+                -- Bottom line — username, centered
+                lbl.TextSize = 11
                 if username then
                     lbl.Text = username
                 end
-                lbl.Size = UDim2.new(lbl.Size.X.Scale, lbl.Size.X.Offset, 0.32, 0)
-                lbl.Position = UDim2.new(lbl.Position.X.Scale, lbl.Position.X.Offset, 0.52, 0)
+                lbl.Size = UDim2.new(1, -8, 0.32, 0)
+                lbl.Position = UDim2.new(0, 4, 0.52, 0)
             end
         end
 
@@ -467,6 +472,24 @@ MovementTab:CreateToggle({
     Description = "Tool that teleports to mouse click",
     Default = false,
     Callback = function(state) ToggleTPTool(state) end,
+})
+
+-- REANIMATION (runner only)
+local ReanimTab = Window:CreateTab("Reanim", Velox.Icons and Velox.Icons.Skull or nil)
+ReanimTab:CreateSection("Reanimation")
+ReanimTab:CreateButton({
+    Name = "Runner Reanimate",
+    Description = "Load runner reanimation script",
+    Callback = function()
+        task.spawn(function()
+            local ok, err = runnerReanimate()
+            if ok then
+                safeNotify("Reanim", "Runner reanimate started", "Success", 2)
+            else
+                safeNotify("Reanim", tostring(err or "Failed — check F9 console"), "Error", 4)
+            end
+        end)
+    end,
 })
 
 -- TARGET
@@ -958,6 +981,52 @@ SettingsTab:CreateButton({
     end,
 })
 
+
+
+function runnerReanimate()
+    if reanimToggleLock then return false, "busy" end
+    reanimToggleLock = true
+    local lastErr = nil
+    local ok, err = pcall(function()
+        local ch = Player.Character
+        if not ch then
+            ch = Player.CharacterAdded:Wait()
+            task.wait(0.4)
+        end
+        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+        local root = ch and ch:FindFirstChild("HumanoidRootPart")
+        if root then
+            root.Anchored = false
+            root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        end
+        if hum then
+            hum.PlatformStand = false
+            hum.Sit = false
+            hum.AutoRotate = true
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+        end
+        task.wait(0.12)
+        local runnerSrc = game:HttpGet(
+            "https://raw.githubusercontent.com/projectZ678/tvm-reanim/refs/heads/master/runner.lua")
+        assert(type(runnerSrc) == "string" and #runnerSrc > 50, "runner HttpGet failed")
+        local runnerFn = loadstring(runnerSrc)
+        assert(runnerFn, "runner loadstring failed")
+        runnerFn()
+        task.wait(0.35)
+        Reanimated = true
+        print("[AETHER] Runner reanimate ON")
+    end)
+    if not ok then
+        lastErr = tostring(err)
+        warn("[AETHER] runnerReanimate error:", lastErr)
+        Reanimated = false
+    end
+    task.delay(0.55, function() reanimToggleLock = false end)
+    return ok, lastErr
+end
+
+
 -- FEATURES (Infinite Yield style: do + localess function)
 do
 function EnableFly()
@@ -1227,11 +1296,40 @@ Player.CharacterAdded:Connect(function(newChar)
     if TPToolActive then ToggleTPTool(false) end
     StopAttachment()
     FlingActive = false
+    if Reanimated then
+        Reanimated = false
+        safeNotify("Reanim", "Character respawned — reanim reset", "Warning", 3)
+    end
     if SpectateActive then
         SpectateActive = false
         if Humanoid then Camera.CameraSubject = Humanoid end
     end
 end)
+
+
+-- Velocity clamp while reanimated
+task.spawn(function()
+    while ScriptActive do
+        RunService.Heartbeat:Wait()
+        if Reanimated then
+            local ch = Player.Character
+            if ch then
+                local root = ch:FindFirstChild("HumanoidRootPart")
+                if root and not root.Anchored then
+                    local v = root.AssemblyLinearVelocity
+                    if v.Magnitude > 250 then
+                        root.AssemblyLinearVelocity = v.Unit * 250
+                    end
+                    local av = root.AssemblyAngularVelocity
+                    if av.Magnitude > 60 then
+                        root.AssemblyAngularVelocity = av.Unit * 60
+                    end
+                end
+            end
+        end
+    end
+end)
+
 
 if Humanoid then
     Humanoid.Died:Connect(function()
